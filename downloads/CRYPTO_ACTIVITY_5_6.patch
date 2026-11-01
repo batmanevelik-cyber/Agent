@@ -1,0 +1,638 @@
+--- a/UPDATE_5_6.md
++++ b/UPDATE_5_6.md
+@@ -0,0 +1,20 @@
++# Alpha50X 5.6 — active crypto PAPER scanning
++
++The crypto scanner checks newly closed one-minute candles independently of
++cross-market history and contract requests. Warm instruments rotate in bounded
++batches; missing histories load in a separate bounded pool through the existing
++provider budgets and backoff. Forming candles never generate entries.
++
++Settings offers Active and Standard crypto scanning. Active is the default;
++the selected mode persists. A counter shows how many different instruments were
++checked in the last minute. Both modes use the existing strategy selection,
++independent model validation, ranked intents and final Risk Guardian checks.
++
++Risk limits, position caps, loss cooldowns, daily fill limits, user pause and kill
++switch remain in force. More scanning does not guarantee a trade or a profit.
++Quote-driven exits remain independent of history loading. Shutdown cannot rearm
++the service. The bounded watchlist scrolling fix remains included.
++
++This is a code-only update for an existing installation. The installer keeps the
++existing ledger, cash balances, positions, credentials, history and manual stops;
++it never replaces them with development fixtures. All trades remain simulated.
+--- a/alpha50x_auto.py
++++ b/alpha50x_auto.py
+@@ -42,6 +42,8 @@
+         s=self.supervisor;j=s.journal
+         if not s.auto_derivatives:return
+         with j._lock:
++            if s.stop_event.is_set():
++                s.engine.pause();self.state='PAUSED';self.reason='Програмата се затваря.';return
+             if j.state('kill_switch',False) or j.state('auto_paper_paused',False):
+                 s.engine.pause();self.state='PAUSED';self.reason='Ръчно спиране. Автоматичното подновяване е блокирано.';return
+             if not s.acceptance_passed:
+--- a/alpha50x_crypto_activity.py
++++ b/alpha50x_crypto_activity.py
+@@ -0,0 +1,215 @@
++"""Closed-candle crypto scanning, independent of slow cross-market REST jobs.
++
++This changes coverage and latency, not strategy signals or PAPER risk limits.
++History requests use the provider's existing shared budgets and source checks.
++"""
++from collections import deque
++from concurrent.futures import ThreadPoolExecutor
++import threading
++import time
++
++
++class CryptoActivity:
++    INTERVAL = .25
++    MAX_HISTORY_JOBS = 4
++    HISTORY_SPACING_MS = 125
++    SCAN_BATCH = 16
++
++    def __init__(self, supervisor, monotonic=time.monotonic):
++        self.s = supervisor
++        self.monotonic = monotonic
++        self.stop_event = threading.Event()
++        self.thread = None
++        self.pool = ThreadPoolExecutor(max_workers=self.MAX_HISTORY_JOBS, thread_name_prefix='crypto-history')
++        self.jobs = {}
++        self.retry_at = {}
++        self.failures = {}
++        self.processed = {}
++        self.ready = {}
++        self.offset = 0
++        self.history_offset = 0
++        self.next_history_ms = 0
++        self.events = deque()
++        self.lock = threading.Lock()
++        self.stats = {'running': False, 'evaluated_last_minute': 0, 'ready_history': 0,
++                      'fresh_quotes': 0, 'watched': 0, 'history_inflight': 0,
++                      'last_scan_ms': None, 'last_error': None}
++
++    def active(self):
++        return (not self.stop_event.is_set() and not self.s.stop_event.is_set()
++                and self.s.config.get('crypto_scan_mode', 'active') == 'active'
++                and 'crypto' in self.s.config['enabled_markets'])
++
++    @staticmethod
++    def valid_history(bars, symbol, now):
++        # Keep only a real contiguous tail. Never interpolate missing candles.
++        if any(b.market != 'crypto' or b.symbol != symbol or b.interval_ms != 60000 for b in bars):
++            raise ValueError('WRONG_CRYPTO_HISTORY')
++        ordered = sorted({b.start_ms: b for b in bars if b.end_ms <= now}.values(), key=lambda b: b.start_ms)[-300:]
++        for i in range(len(ordered)-1, 0, -1):
++            if ordered[i-1].end_ms != ordered[i].start_ms:
++                ordered = ordered[i:]
++                break
++        return ordered if len(ordered) >= 40 and 0 <= now-ordered[-1].end_ms <= 90000 else []
++
++    def _history(self, symbol, now):
++        bars = self.s.history_cache.get(('crypto', symbol), [])
++        stream = self.s.stream
++        if stream is not None:
++            with stream.lock:
++                received = list(stream.bars.get(symbol, {}).values())
++            bars = [*bars, *received]
++        return self.valid_history(bars, symbol, now)
++
++    def _harvest(self, now):
++        for symbol, future in list(self.jobs.items()):
++            if not future.done():
++                continue
++            self.jobs.pop(symbol)
++            try:
++                bars = self.valid_history(future.result(), symbol, now)
++                if not bars:
++                    self.ready.pop(symbol, None)
++                    raise ValueError('INCOMPLETE_CRYPTO_HISTORY')
++                self.s.history_cache[('crypto', symbol)] = bars
++                self.failures.pop(symbol, None)
++                self.retry_at.pop(symbol, None)
++            except Exception as error:
++                category = getattr(error, 'category', type(error).__name__)
++                failures = self.failures.get(symbol, 0)+1
++                self.failures[symbol] = failures
++                delay = 300000 if category == 'ACCESS_DENIED' else 60000 if category in ('RATE_LIMIT', 'REQUEST_BUDGET') else min(60000, 2000*2**min(5, failures-1))
++                self.retry_at[symbol] = now+delay
++                with self.lock:
++                    self.stats['last_error'] = category
++
++    def pulse(self):
++        now = int(self.s.clock()*1000)
++        self._harvest(now)
++        if not self.active():
++            with self.lock:
++                self.stats['running'] = False
++            return
++        s = self.s
++        with s.journal._lock:
++            symbols = list(s.config['watchlists']['crypto'])
++            quotes = {symbol: s.engine.quotes.get(('crypto', symbol)) for symbol in symbols}
++            rates = dict(s.engine.fx)
++            limits = s.engine.guardian.limits
++            volumes = {symbol: item.get('quote_volume', 0) for symbol, item in s.daily_stats.get('crypto', {}).items()}
++        eligible = []
++        for symbol in symbols:
++            q = quotes[symbol]
++            if q is None:
++                continue
++            try:
++                q.validate(now, max_age=limits.max_quote_age_ms)
++                rates[q.currency].validate(now)
++                if q.bid_size <= 0 or q.ask_size <= 0 or (q.ask/q.bid-1)*10000 > limits.max_spread_bps:
++                    continue
++                eligible.append(symbol)
++            except (ValueError, KeyError):
++                continue
++        # Only inspect the last received start here. Full series are copied when
++        # there is a new closed candle, not on every price tick.
++        stream = s.stream
++        if stream is not None:
++            with stream.lock:
++                stream_ends = {symbol: max(b.end_ms for b in bars.values() if b.end_ms <= now)
++                               for symbol, bars in stream.bars.items() if any(b.end_ms <= now for b in bars.values())}
++        else:
++            stream_ends = {}
++        ready = []
++        cold = []
++        for symbol in eligible:
++            cached = s.history_cache.get(('crypto', symbol), [])
++            end = max(cached[-1].end_ms if cached else 0, stream_ends.get(symbol, 0))
++            if end and 0 <= now-end <= 90000:
++                ready.append((symbol, end))
++            else:
++                cold.append(symbol)
++        # Liquid symbols warm first, but a rotating cursor gives the rest of
++        # the eligible universe a turn instead of rescanning only the majors.
++        cold.sort(key=lambda symbol: -volumes.get(symbol, 0))
++        if cold and len(self.jobs) < self.MAX_HISTORY_JOBS and now >= self.next_history_ms:
++            for i in range(len(cold)):
++                index = (self.history_offset+i) % len(cold)
++                symbol = cold[index]
++                if symbol in self.jobs or now < self.retry_at.get(symbol, 0):
++                    continue
++                self.jobs[symbol] = self.pool.submit(s.providers.candles, 'crypto', symbol)
++                self.history_offset = index+1
++                self.next_history_ms = now+self.HISTORY_SPACING_MS
++                break
++        entries = []
++        started = self.monotonic()
++        evaluated = 0
++        for i in range(len(ready)):
++            index = self.offset % len(ready)
++            self.offset += 1
++            symbol, end = ready[index]
++            if self.processed.get(symbol) == end:
++                continue
++            if not self.active():
++                break
++            try:
++                bars = self._history(symbol, now)
++                if not bars:
++                    self.ready.pop(symbol, None)
++                    # A fresh final bar does not make a gapped/short series ready.
++                    if symbol not in self.jobs and now >= self.retry_at.get(symbol, 0) and len(self.jobs) < self.MAX_HISTORY_JOBS and now >= self.next_history_ms:
++                        self.jobs[symbol] = self.pool.submit(s.providers.candles, 'crypto', symbol)
++                        self.next_history_ms = now+self.HISTORY_SPACING_MS
++                    continue
++                self.ready[symbol] = bars[-1].end_ms
++                outcome = s.process(quotes[symbol], bars, int(s.clock()*1000), defer_entries=True)
++                self.processed[symbol] = bars[-1].end_ms
++                self.events.append((now, symbol))
++                evaluated += 1
++                if isinstance(outcome, dict):
++                    entries.append(outcome)
++            except Exception as error:
++                # No fabricated HOLD or fill when one asset fails. The next
++                # pulse retries it; the journal's immutable IDs prevent repeats.
++                with self.lock:
++                    self.stats['last_error'] = getattr(error, 'category', type(error).__name__)
++            if evaluated >= self.SCAN_BATCH or self.monotonic()-started >= .08:
++                break
++        if self.active():
++            s.execute_ranked_entries(entries)
++        while self.events and self.events[0][0] < now-60000:
++            self.events.popleft()
++        universe = set(symbols)
++        for mapping in (self.processed, self.ready, self.failures, self.retry_at):
++            for symbol in set(mapping)-universe:
++                mapping.pop(symbol, None)
++        with self.lock:
++            self.stats.update(running=True, evaluated_last_minute=len({symbol for _, symbol in self.events}),
++                              ready_history=sum(0 <= now-end <= 90000 for symbol,end in self.ready.items() if symbol in quotes), fresh_quotes=len(eligible), watched=len(symbols),
++                              history_inflight=len(self.jobs), last_scan_ms=now)
++
++    def snapshot(self):
++        with self.lock:
++            return {**self.stats, 'mode': self.s.config.get('crypto_scan_mode', 'active'),
++                    'paper_only': True, 'risk_limits_changed': False}
++
++    def start(self):
++        if self.thread is not None:
++            return
++        def run():
++            while not self.stop_event.is_set() and not self.s.stop_event.is_set():
++                try:
++                    self.pulse()
++                except Exception as error:
++                    with self.lock:
++                        self.stats['last_error'] = getattr(error, 'category', type(error).__name__)
++                        self.stats['running'] = False
++                self.stop_event.wait(self.INTERVAL)
++        self.thread = threading.Thread(target=run, name='crypto-candle-scanner', daemon=True)
++        self.thread.start()
++
++    def close(self):
++        self.stop_event.set()
++        if self.thread is not None:
++            self.thread.join()
++        self.pool.shutdown(wait=True, cancel_futures=True)
+--- a/alpha50x_diagnostics.py
++++ b/alpha50x_diagnostics.py
+@@ -6,7 +6,7 @@
+ 
+ def report(supervisor):
+     state=supervisor.snapshot();stream=supervisor.stream
+-    return {'version':'5.5.1-watchlist-scroll','platform':platform.system(),'python':platform.python_version(),'timestamp_ms':int(time.time()*1000),
++    return {'version':'5.6-crypto-activity','platform':platform.system(),'python':platform.python_version(),'timestamp_ms':int(time.time()*1000),
+             'credential_presence':CredentialStore.status(),'enabled_markets':supervisor.config['enabled_markets'],
+             'providers':state['providers'],'readiness':state['readiness'],'last_error':state['last_error'],
+             'derivative_discovery':getattr(supervisor.providers,'discovery_report',{}),
+--- a/alpha50x_runtime.py
++++ b/alpha50x_runtime.py
+@@ -28,7 +28,7 @@
+  'watchlists':{'crypto':[s+'USDT' for s in CRYPTO], 'stocks':STOCKS,
+                'forex':'EURUSD GBPUSD USDJPY USDCHF USDCAD AUDUSD NZDUSD EURGBP EURJPY EURCHF EURCAD EURAUD EURNZD GBPJPY GBPCHF GBPCAD GBPAUD GBPNZD CHFJPY CADJPY AUDJPY NZDJPY AUDCAD AUDCHF AUDNZD NZDCAD NZDCHF CADCHF'.split(),'derivatives':['BTCUSDT','ETHUSDT']},
+  'enabled_markets':['crypto','stocks'], 'strategy':'trend', 'daily_target_pct':20,
+- 'poll_seconds':10,'batch_size':4,'limits':asdict(Limits()),'disabled_dates':[],
++ 'poll_seconds':10,'batch_size':4,'crypto_scan_mode':'active','limits':asdict(Limits()),'disabled_dates':[],
+  'derivatives_notice':'Linear USDT long-only paper contracts; maintenance/liquidation is a conservative estimate, not an exchange guarantee.'}
+ 
+ def load_config(path=None):
+@@ -44,6 +44,7 @@
+         if not isinstance(symbols,list) or len(symbols)>(2000 if market in ('crypto','derivatives') else 200):raise ValueError('watchlist exceeds supported size')
+         config['watchlists'][market]=list(dict.fromkeys(normalize_symbol(market,s) for s in symbols))
+     if not 1<=config['poll_seconds']<=3600 or not 1<=config['batch_size']<=20:raise ValueError('invalid polling configuration')
++    if config['crypto_scan_mode'] not in ('active','standard'):raise ValueError('invalid crypto scan mode')
+     if type(config['daily_target_pct']) not in (float,int) or not 0<=config['daily_target_pct']<=100:raise ValueError('invalid KPI')
+     Limits(**config['limits']);Strategy(config['strategy'])
+     return config
+@@ -82,6 +83,8 @@
+         from alpha50x_learning import Learning
+         self.learning=Learning(journal,self.strategy.name)
+         self.data_plane=None
++        self.crypto_activity=None
++        self.config['crypto_scan_mode']=journal.state('crypto_scan_mode',self.config.get('crypto_scan_mode','active'))
+         self.history_cache={}
+         from alpha50x_signals import SignalQueue
+         self.signal_queue=SignalQueue(self)
+@@ -147,6 +150,9 @@
+         if self.data_plane is None:
+             from alpha50x_data import DataPlane
+             self.data_plane=DataPlane(self);self.data_plane.start()
++        if self.crypto_activity is None:
++            from alpha50x_crypto_activity import CryptoActivity
++            self.crypto_activity=CryptoActivity(self);self.crypto_activity.start()
+ 
+     def refresh_live(self,now=None):
+         """Sync the full stream independently of slow candle/REST round-robin.
+@@ -337,6 +343,7 @@
+         if not entries:return
+         batch=sorted(entries,key=lambda e:(-e['score'],e['quote'].market,e['quote'].symbol));entries.clear()
+         for index,entry in enumerate(batch):
++            if self.stop_event.is_set():return
+             q=entry['quote'];now=int(self.clock()*1000)
+             self.refresh_live(now);self.auto.tick(now)
+             q=self.engine.quotes.get((q.market,q.symbol),q)
+@@ -362,11 +369,6 @@
+                     j.db.executemany('INSERT OR IGNORE INTO ax_bars VALUES(?,?,?,?)',[(b.market,b.symbol,b.start_ms,encoded(asdict(b))) for b in bars if b.start_ms not in known])
+                     j.db.execute('COMMIT')
+                 except BaseException:j.db.execute('ROLLBACK');raise
+-            # Keep the current contiguous tail only, never bridge session/data gaps.
+-            rows=j.db.execute('SELECT payload FROM ax_bars WHERE market=? AND symbol=? ORDER BY start DESC LIMIT 150',key).fetchall()
+-            series=[Candle(**json.loads(r[0])) for r in reversed(rows)]
+-            for i in range(len(series)-1,0,-1):
+-                if series[i].start_ms!=series[i-1].end_ms:series=series[i:];break
+             held=j.position(*key) if q.market!='derivatives' else (j.db.execute('SELECT quantity FROM ax_derivatives WHERE symbol=?',(q.symbol,)).fetchone() or (0,))[0]
+             if self.engine.scope=='autonomous_cash_only' and key in self.engine.preserved_assets():return 'PRESERVED_LEGACY_HOLDING'
+             plan=j.state('plan:'+q.market+':'+q.symbol)
+@@ -380,6 +382,11 @@
+                 if reason:
+                     return self.execute(q,'SELL',held,plan['stop'],now,f'exit:{q.market}:{q.symbol}:{q.timestamp_ms}',reason,{'quote':asdict(q),'plan':plan})
+             if exits_only:return 'NO_PRICE_EXIT'
++            # Quote-driven exits do not need to decode 150 strategy candles.
++            rows=j.db.execute('SELECT payload FROM ax_bars WHERE market=? AND symbol=? ORDER BY start DESC LIMIT 150',key).fetchall()
++            series=[Candle(**json.loads(r[0])) for r in reversed(rows)]
++            for i in range(len(series)-1,0,-1):
++                if series[i].start_ms!=series[i-1].end_ms:series=series[i:];break
+             if not series:return 'NO_CANDLES'
+             self.learning.request(key,now,self.engine.guardian.limits,(q.ask/q.bid-1)*10000)
+             regime=indicators(series)['regime'] if len(series)>=30 else None
+@@ -675,6 +682,7 @@
+                     'last_error':self.last_error,'portfolio':a,'fills':fills,'decisions':decisions,'assets':assets,
+                     'providers':self.providers.status(),'mcp':self.providers.mcp.snapshot() if getattr(self.providers,'mcp',None) is not None else {'runtime':{'state':'NOT_CONFIGURED'}},
+                     'data_collection':self.data_plane.snapshot() if self.data_plane else {'running':False},
++                    'crypto_activity':self.crypto_activity.snapshot() if self.crypto_activity else {'running':False,'mode':self.config.get('crypto_scan_mode','active')},
+                     'news':self.news,'limits':self.config['limits'],'strategy':self.strategy.name}
+ 
+     def run(self):
+@@ -688,6 +696,7 @@
+ 
+     def close(self):
+         self.stop_event.set();self.engine.pause()
++        if self.crypto_activity:self.crypto_activity.close()
+         if self.data_plane:self.data_plane.close()
+         if self.stream:self.stream.close()
+         if self.derivative_stream:self.derivative_stream.close()
+--- a/alpha50x_terminal_v55.html
++++ b/alpha50x_terminal_v55.html
+@@ -28,13 +28,13 @@
+ @media(max-width:1600px){.workspace{grid-template-columns:370px minmax(0,1fr) 270px}.workspace .chart{height:340px;min-height:340px}.watch-scroll{height:600px}.summary{grid-template-columns:repeat(4,minmax(100px,1fr)) 155px}.compare-card{padding:8px}.compare-card table td{font-size:10px}.daily-lower{grid-template-columns:1fr 1.2fr 1fr}}
+ @media(max-width:1260px){.workspace{grid-template-columns:340px minmax(0,1fr)}.right-stack{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr}.execution-box{grid-column:1/-1}.summary{grid-template-columns:repeat(3,1fr)}.daily-lower{grid-template-columns:1fr 1fr}.daily-lower>.panel:last-child{grid-column:1/-1}}
+ @media(max-width:740px){.workspace{display:block}.workspace>article:first-child{display:block}.watch-scroll{height:330px;min-height:0}.summary{grid-template-columns:1fr 1fr}.summary>.metric:last-child{grid-column:1/-1}.compare-grid{grid-template-columns:1fr}.right-stack{display:block}.daily-lower{display:block}.daily-lower>.panel{margin-top:14px;height:430px}.workspace .chart{height:330px;min-height:330px}.compare-head{display:block}.chart-tools{gap:4px}}
+-</style></head><body><div class="preview-banner">Чернова 5.5 за одобрение · показаните данни са тестови</div><header><div class="brand">◇ Alpha50X<span>TERMINAL</span><span class="paper">PAPER 5.5.1 · чернова</span></div><div class="header-right"><span id="connected" class="demo">Свързване с данните…</span><button class="stop" id="axEmergencyStop">■ Спри агента</button></div></header>
++</style></head><body><div class="preview-banner">Чернова 5.5 за одобрение · показаните данни са тестови</div><header><div class="brand">◇ Alpha50X<span>TERMINAL</span><span class="paper">PAPER 5.6 · чернова</span></div><div class="header-right"><span id="connected" class="demo">Свързване с данните…</span><button class="stop" id="axEmergencyStop">■ Спри агента</button></div></header>
+ <nav id="workspaceTabs"><button class="active" data-view="terminal">Терминал</button><button data-view="trades">Сделки</button><button data-view="strategies">Стратегии и обучение</button><button data-view="markets">Пазари</button><button data-view="settings">Настройки</button><span class="nav-extra">Само симулирана търговия</span></nav><nav class="helper-hidden" id="tabs"><button data-tab="all">Dashboard</button><button data-tab="stock">▥ Stocks</button><button data-tab="crypto" class="active">◈ Crypto</button><button data-tab="forex">₣ Forex</button><button data-tab="metals">◐ Metals &amp; ETFs</button><button data-tab="all">◴ All Assets</button><button>▤ News</button><button>◷ Performance</button><button id="axBacktestingNav">◫ Backtesting</button><button id="axRiskNav">◉ Risk Guardian</button><button id="axSettingsNav">⚙ Settings</button><button data-tab="derivatives">Derivatives · PAPER</button></nav><main id="viewTerminal"><section class="summary"><div class="metric"><small>Бюджет на агента · PAPER</small><strong id="equity">—</strong><p>Активен бюджет за автоматични сделки</p></div><div class="metric"><small>Свободни средства</small><strong id="cash">—</strong><p>Наличен виртуален кеш</p></div><div class="metric"><small>Активни позиции</small><strong id="positionCount">—</strong><p id="axManagedNote">Позиции на авторежима</p></div><div class="metric"><small>Резултат за деня</small><strong id="pnl">—</strong><p id="axDailyReturn">—</p></div><div class="metric"><div class="target"><small>Дневна цел</small><strong id="axGoalTarget">20%</strong></div><div class="track"><i id="axGoalProgress"></i></div><p id="axGoalCaption">Цел, която се проследява; не е обещана печалба</p></div></section><section class="workspace"><article class="panel"><div class="head"><h3>Наблюдавани активи</h3><span class="small" id="count"></span></div>
+ <div class="filters" id="watchFilters"><button class="active" data-market="crypto">Crypto</button><button data-market="derivatives">Деривати</button><button data-market="stocks">Stocks</button><button data-market="forex">Forex</button><button data-market="all">Всички</button></div>
+ <div class="search-row"><input id="search" placeholder="Търси актив…"><select id="axSort"><option value="volume">По обем</option><option value="score">По сигнал</option><option value="symbol">Символ</option></select></div>
+ <div class="scroll watch-scroll"><table><thead><tr><th>Актив</th><th>Цена / 24ч.</th><th>Сигнал</th></tr></thead><tbody id="scanner"></tbody></table></div></article><div><article class="panel"><div class="chart-head"><b id="chartName">BTC/USDT</b><span class="small" id="chartSymbol">Bitcoin</span><span class="small" id="axLiveTick">Изчаква котировка</span><span class="price" id="axSelectedPrice">—</span><span id="planBadge" class="pill">WAIT</span></div>
+ <div class="chart-tools" id="timeframes"><button data-period="1m" class="active">1m</button><button data-period="5m">5m</button><button data-period="15m">15m</button><button data-period="1h">1h</button><button data-period="4h">4h</button><button data-period="1d">1D</button><select id="chartAsset"></select><button id="axChartRefresh">↻</button></div>
+-<div class="chart-tools" id="axChartTools"><button id="axChartZoomIn">＋</button><button id="axChartZoomOut">−</button><button id="axChartReset">Последни свещи</button><button id="axChartPan" class="active">↔ Движение</button><button id="axChartTrend">╱ Тренд линия</button><button id="axChartLevel">─ Ниво</button><button id="axChartUndo">↶ Назад</button><button id="axChartClear">Изчисти</button><button id="axChartFocus">⤢ Разшири</button></div><button class="indicator-button" id="axIndicators">Индикатори</button><div id="chartStats" class="chart-stats">EMA9 · EMA26 · RSI · Volume</div><div id="chart" class="chart"></div><div class="indicator-row helper-hidden"><span id="axRSIValue">RSI —</span><div id="axRSI"></div></div><div class="indicator-row helper-hidden"><span id="axMACDValue">MACD —</span><div id="axMACD"></div></div><div class="chart-footer" id="chartInfo">Waiting for data…</div><div class="tradeplan"><div><small>Избрана стратегия</small><b id="axStrategyLabel">—</b></div><div><small>Риск / потенциална цел</small><b id="axRiskReward">—</b></div><div><small>Риск на сделка</small><b id="axRiskPercent">—</b></div></div><details class="plan-toggle"><summary>План, стоп и причини за вход · Подробности</summary><article class="plan-details"><div class="head"><h3 id="planTitle">Trade Plan — BTC/USDT</h3></div><div class="plan-rows" id="planRows"></div><button id="axExecute" class="execute" disabled>▶ Execute Paper Trade</button><div class="checks"><b>Key Reasons</b><div id="checks">Waiting for validated inputs</div></div><div class="help-line" id="chartSignal"></div></article></details></article><article class="panel compare-box"><div class="compare-head"><h3>Сравнение на активи и стратегии</h3><select id="axCompareMode"><option value="assets">Три актива</option><option value="strategies">Един актив · три стратегии</option></select></div><div class="compare-grid" id="axCompareGrid"><div class="compare-card" id="axCompare0"><h4>BTCUSDT</h4><select><option>Тренд</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div><div class="compare-card" id="axCompare1"><h4>ETHUSDT</h4><select><option>VWAP</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div><div class="compare-card" id="axCompare2"><h4>SOLUSDT</h4><select><option>Импулс</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div></div></article></div><aside class="right-stack"><article class="panel agent"><div class="agent-title"><b>Автономен агент</b><span class="pillBadge" id="axAgentState">Зареждане</span></div><p id="autoInfo">Изчаква се състоянието на програмата.</p><button class="switch" id="toggle">Старт PAPER</button><div class="agent-footer"><span>Само PAPER сделки</span><a id="axRiskSettingsLink">Риск → настройки</a></div><div id="axBudget" class="auto-note"></div></article><article class="panel positions positions-compact"><div class="head"><h3>Отворени позиции <span id="posCount"></span></h3></div><div class="scroll positions-scroll"><table class="positions-table"><thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Current</th><th>P/L €</th><th>P/L %</th><th></th></tr></thead><tbody id="positions"></tbody></table></div></article><article class="panel execution-box"><h3>Сигнали и изпълнение</h3><div id="axExecutionSummary" class="prompt-help">Всеки BUY/SELL се проверява за изпълнение.</div><div id="axExecutionFeed"><div class="execution-item"><b>Кандидати за сделки</b><span class="reason-text">Тук ще се виждат изпълнените, чакащите и блокираните сигнали с конкретна причина.</span></div></div></article></aside></section><section class="daily-lower"><article class="panel"><div class="head"><h3>Market Opportunities</h3><a data-open-view="markets">Всички →</a></div><div class="opportunity-filters" id="opportunityFilters"><button data-market="all" class="active">Всички</button><button data-market="crypto">Крипто</button><button data-market="stocks">Акции</button><button data-market="derivatives">Деривати</button><button data-market="forex">Forex</button></div><div class="scroll"><table><tbody id="axOpportunities"></tbody></table></div></article><article class="panel"><div class="head"><h3>Recent Trades</h3><a data-open-view="trades">Подробно в „Сделки“ →</a></div><div class="scroll"><table><thead><tr><th>Час</th><th>Актив</th><th>Действие</th><th>Стратегия</th><th>P/L €</th></tr></thead><tbody id="trades"></tbody></table></div><div id="axRecentEmpty" class="empty" hidden>Няма нови PAPER сделки. Архивната история е отделена в „Сделки“.</div><span id="axArchiveCount" class="helper-hidden"></span></article><article class="panel" id="newsCard"><div class="head"><h3>News</h3><a id="axAllNews">Всички новини →</a></div><div class="opportunity-filters"><select id="newsFilter"><option value="all">Всички новини</option></select><button id="axNewsEarnings">Отчети</button><button id="axNewsInsider">Insider</button><button id="axNewsCrypto">Крипто</button></div><div id="news" class="news-list"></div></article></section><div class="status-line"><span id="axStatus">PAPER · без реални поръчки</span><span id="return"></span><span id="updated"></span><a id="axOpenConnections">Източници</a></div></main><section id="viewTrades" class="view-panel" hidden><div class="subtitle-row"><div><h2>Сделки</h2><p class="view-caption">История на PAPER изпълненията, стратегия и причини за действията.</p></div><button id="axExportTrades">↓ Експорт CSV</button></div><section class="summary" style="grid-template-columns:repeat(4,1fr)"><div class="metric"><small>Реализиран резултат</small><strong id="axHistoryRealized">—</strong></div><div class="metric"><small>Изпълнения</small><strong id="axHistoryCount">—</strong></div><div class="metric"><small>Печеливши / губещи изходи</small><strong id="axHistoryWinLoss">—</strong></div><div class="metric"><small>Такси за избраните изпълнения</small><strong id="axHistoryFees">—</strong></div></section><section class="trade-workspace"><article class="panel trade-history"><div class="trade-filters"><select id="axHistoryDays"><option value="1">Последни 24 ч.</option><option value="7">7 дни</option><option value="30">30 дни</option><option value="all">Всичко</option></select><select id="axHistoryMarket"><option value="">Всички пазари</option><option value="crypto">Крипто</option><option value="derivatives">Деривати</option><option value="stocks">Акции</option><option value="forex">Forex</option></select><select id="axHistoryStrategy"><option value="">Всички стратегии</option><option value="trend">Тренд</option><option value="vwap">VWAP</option><option value="momentum">Импулс</option><option value="mean_reversion">Връщане към средната</option><option value="breakout">Пробив</option></select><select id="axHistorySide"><option value="">Всички изпълнения</option><option value="SELL">Продажби</option><option value="BUY">Покупки</option></select></div><div class="scroll"><table class="trade-rows"><thead><tr><th>Час</th><th>Актив</th><th>Действие</th><th>Стратегия</th><th>Количество</th><th>Вход</th><th>Изход</th><th>Такса €</th><th>P/L €</th><th>Причина</th></tr></thead><tbody id="axHistoryRows"></tbody></table><div id="axHistoryEmpty" class="empty" hidden>Няма изпълнения за избрания период.</div></div><div class="pagination"><span id="axHistoryPagination"></span><span><button id="axHistoryPrev">‹</button><button id="axHistoryNext">›</button></span></div></article><aside><article class="panel"><div class="head" style="padding:17px"><h3>Подробности за сделката</h3><span class="paper">PAPER</span></div><div id="axTradeDetails" class="details-block">Избери изпълнение от таблицата.</div><div class="detail-actions"><button id="axShowTradeChart" disabled>Виж графиката →</button></div></article></aside></section><details class="notice"><summary>Показатели и крива на PAPER бюджета</summary><article class="panel" id="performanceCard"><div class="head"><h3>Performance</h3><div class="opportunity-filters"><button class="active" data-performance="1d">1D</button><button data-performance="1w">1W</button><button data-performance="1m">1M</button><button data-performance="all">ALL</button></div></div><div class="performance-kpis"><div><small>Total Return</small><strong id="perfReturn" class="green">—</strong></div><div><small>Realized P/L</small><strong id="axRealized">—</strong></div><div><small>Unrealized P/L</small><strong id="axUnrealized">—</strong></div><div><small>Profit Factor</small><strong id="axPerfFactor">—</strong></div></div><div class="performance-extra"><span>Win Rate <b id="perfWin">—</b></span><span>Max Drawdown <b id="axPerfDrawdown">—</b></span></div><div id="v33curve" class="v33-curve"></div><div class="tiny" id="performanceNotice"></div><span class="helper-hidden" id="perfClosed"></span></article><div class="performance-extra"><span>Общо изпълнения: <b id="tradeCount">—</b></span><span>Win rate: <b id="winRate">—</b></span><span>Profit factor: <b id="profitFactor">—</b></span><span>Drawdown: <b id="headerDrawdown">—</b></span></div></details><details class="notice"><summary>Архивна история и запазени позиции</summary><p class="view-caption">Архивните резултати не се включват като нови PAPER сделки. Запазените позиции не са обезпечение за авторежима.</p><div id="axLegacyPositions"></div><table class="trade-rows"><thead><tr><th>Дата</th><th>Актив</th><th>Действие</th><th>Цена</th><th>Архивен P/L</th></tr></thead><tbody id="axLegacyRows"></tbody></table></details></section><section id="viewStrategies" class="view-panel" hidden><h2>Стратегии и обучение</h2><p class="view-caption">Адаптивен избор между проверени правила. Целта за деня не увеличава риска и не отменя проверките.</p><article class="panel prompt-panel"><div class="head"><h3>Контролен прозорец · идеи и стратегии</h3><span class="paper">PAPER изследване</span></div><p class="prompt-help">Опиши правила, постави структурирана стратегия или транскрипция. Всяка идея се показва като точни условия и се тества върху отделени данни.</p><textarea id="axStrategyPrompt" placeholder="Пример: EMA 9 пресича EMA 26 нагоре, RSI между 45 и 70, стоп 1%, цел 2%. Изход при обратно пресичане."></textarea><div class="prompt-actions"><button id="axParseStrategy">Разпознай правилата</button><button id="axTestStrategy">Тествай и сравни</button><button id="axAuditTrades">Анализирай сделките</button><span class="prompt-help">Избран актив: <b id="axStudioAsset">BTCUSDT</b></span></div><div id="axParsedRules" class="rule-preview"><b>Разпознатите условия ще се появят тук</b><p>Вход · изход · стоп · цел · период · източник на идеята</p></div><div id="axPromptHistory" class="prompt-feed">Резултатите ще показват такси, спад, брой сделки и тест извън обучаващите данни.</div></article><article class="panel prompt-panel"><h3>Библиотека от предоставените материали</h3><div id="axReferenceLibrary" class="prompt-help"></div></article><section class="learning-grid"><article class="panel"><small class="muted">Адаптивен избор</small><h3 id="axLearningState">—</h3><p id="axLearningMethod" class="view-caption"></p></article><article class="panel"><small class="muted">Валидирани модели</small><h3 id="axLearningModels">—</h3><p class="view-caption">Обучение, отделен тест и проверка при по-високи разходи.</p></article><article class="panel"><small class="muted">Затворени PAPER резултати</small><h3 id="axLearningOutcomes">—</h3><p class="view-caption">Натрупва се собствена история за оценка на резултатите.</p></article></section><article class="panel" style="padding:17px"><h3>Последни оценки на активите</h3><table class="trade-rows"><thead><tr><th>Пазар</th><th>Актив</th><th>Състояние</th><th>Стратегия</th><th>Данни</th></tr></thead><tbody id="axLearningRows"></tbody></table><div id="axLearningEmpty" class="empty">Оценките се появяват след получаване на завършени свещи.</div></article><article class="panel" style="padding:17px;margin-top:16px"><h3>Отделен бектест</h3><p class="view-caption" id="axResearchAsset"></p><button id="axResearchAction">Тествай стратегиите за избрания актив</button><div id="axResearchResult" class="notice"></div></article></section><section id="viewMarkets" class="view-panel" hidden><h2>Пазари и котировки</h2><p class="view-caption">Всяка цена има източник и възраст. При затворен пазар последната цена не се представя като нова котировка.</p><section class="summary" id="axDataCoverage" style="grid-template-columns:repeat(4,1fr)"></section><div class="trade-filters"><input id="axMarketSearch" placeholder="Търси актив…"><select id="axMarketType"><option value="">Всички пазари</option><option value="crypto">Крипто</option><option value="derivatives">Binance USDT perpetual</option><option value="stocks">Акции и ETF</option><option value="forex">Forex</option></select><span class="muted" id="axMarketCount"></span></div><article class="panel"><div class="scroll" style="max-height:460px"><table class="trade-rows"><thead><tr><th>Актив</th><th>Пазар</th><th>Цена</th><th>Състояние</th><th>Възраст</th><th>Източник</th></tr></thead><tbody id="axMarketRows"></tbody></table></div></article><div class="market-ribbons"><section class="ribbon-grid"><article class="panel"><div class="head"><h3>Forex Market (28 Pairs)</h3><span class="tiny">Majors · Minors · Crosses</span></div><div id="v33forex" class="ribbon"></div></article><article class="panel"><div class="head"><h3>Metals (6)</h3><span class="tiny">Exchange-traded proxies</span></div><div id="v33metals" class="ribbon"></div></article></section></div></section><section id="viewSettings" class="view-panel" hidden><h2 style="margin-bottom:17px">Настройки и връзки</h2><section class="panel settings-drawer" id="settingsDrawer" hidden><div class="head"><h3>Настройки · PAPER · 5.5.1</h3><button id="axSettingsClose">Затвори</button></div>
+-<div class="head"><button id="axArm">Enable PAPER</button><button id="axPause">Пауза</button><button id="axKill">Спирачка</button><button id="axReset">Нулирай спирачката (на пауза)</button><select id="axProfile"><option value="conservative">Conservative</option><option value="balanced">Balanced</option><option value="aggressive">Aggressive</option></select><label>Цел % <input id="axTarget" type="number" min="0" max="100" value="20" style="width:65px"></label><button id="axRunResearch">Тествай стратегията</button></div><div id="axAdvancedRisk"><div class="profiles" id="axProfileButtons"><button data-profile="conservative">Conservative</button><button data-profile="balanced">Balanced</button><button class="active" data-profile="aggressive">Aggressive</button></div><label class="risk-slider"><span>⊙ Max Positions</span><input id="axMaxPositions" type="range" min="1" max="20" value="8"><output id="axMaxPositionsValue">8</output></label><label class="risk-slider"><span>⊙ Risk per Trade</span><input id="axRiskRange" type="range" min="0.1" max="2" step="0.1" value="1"><output id="axRiskValue">1.0%</output></label><label class="risk-slider"><span>⊙ Daily Loss Limit</span><input id="axLossRange" type="range" min="1" max="10" step="0.5" value="5"><output id="axLossValue">5.0%</output></label></div><div id="axMessage"></div><div id="axAcceptance"></div><div id="axKPI"></div>
++<div class="chart-tools" id="axChartTools"><button id="axChartZoomIn">＋</button><button id="axChartZoomOut">−</button><button id="axChartReset">Последни свещи</button><button id="axChartPan" class="active">↔ Движение</button><button id="axChartTrend">╱ Тренд линия</button><button id="axChartLevel">─ Ниво</button><button id="axChartUndo">↶ Назад</button><button id="axChartClear">Изчисти</button><button id="axChartFocus">⤢ Разшири</button></div><button class="indicator-button" id="axIndicators">Индикатори</button><div id="chartStats" class="chart-stats">EMA9 · EMA26 · RSI · Volume</div><div id="chart" class="chart"></div><div class="indicator-row helper-hidden"><span id="axRSIValue">RSI —</span><div id="axRSI"></div></div><div class="indicator-row helper-hidden"><span id="axMACDValue">MACD —</span><div id="axMACD"></div></div><div class="chart-footer" id="chartInfo">Waiting for data…</div><div class="tradeplan"><div><small>Избрана стратегия</small><b id="axStrategyLabel">—</b></div><div><small>Риск / потенциална цел</small><b id="axRiskReward">—</b></div><div><small>Риск на сделка</small><b id="axRiskPercent">—</b></div></div><details class="plan-toggle"><summary>План, стоп и причини за вход · Подробности</summary><article class="plan-details"><div class="head"><h3 id="planTitle">Trade Plan — BTC/USDT</h3></div><div class="plan-rows" id="planRows"></div><button id="axExecute" class="execute" disabled>▶ Execute Paper Trade</button><div class="checks"><b>Key Reasons</b><div id="checks">Waiting for validated inputs</div></div><div class="help-line" id="chartSignal"></div></article></details></article><article class="panel compare-box"><div class="compare-head"><h3>Сравнение на активи и стратегии</h3><select id="axCompareMode"><option value="assets">Три актива</option><option value="strategies">Един актив · три стратегии</option></select></div><div class="compare-grid" id="axCompareGrid"><div class="compare-card" id="axCompare0"><h4>BTCUSDT</h4><select><option>Тренд</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div><div class="compare-card" id="axCompare1"><h4>ETHUSDT</h4><select><option>VWAP</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div><div class="compare-card" id="axCompare2"><h4>SOLUSDT</h4><select><option>Импулс</option><option>Автоматичен избор</option></select><table><tr><td>Сигнал</td><td>—</td></tr><tr><td>Изпълнение</td><td>Проверка на риска</td></tr><tr><td>RSI / посока</td><td>—</td></tr><tr><td>Резултат от тест</td><td>—</td></tr></table><small>Завършени свещи · PAPER</small></div></div></article></div><aside class="right-stack"><article class="panel agent"><div class="agent-title"><b>Автономен агент</b><span class="pillBadge" id="axAgentState">Зареждане</span></div><p id="axCryptoScanInfo" class="muted"></p><p id="autoInfo">Изчаква се състоянието на програмата.</p><button class="switch" id="toggle">Старт PAPER</button><div class="agent-footer"><span>Само PAPER сделки</span><a id="axRiskSettingsLink">Риск → настройки</a></div><div id="axBudget" class="auto-note"></div></article><article class="panel positions positions-compact"><div class="head"><h3>Отворени позиции <span id="posCount"></span></h3></div><div class="scroll positions-scroll"><table class="positions-table"><thead><tr><th>Asset</th><th>Side</th><th>Entry</th><th>Current</th><th>P/L €</th><th>P/L %</th><th></th></tr></thead><tbody id="positions"></tbody></table></div></article><article class="panel execution-box"><h3>Сигнали и изпълнение</h3><div id="axExecutionSummary" class="prompt-help">Всеки BUY/SELL се проверява за изпълнение.</div><div id="axExecutionFeed"><div class="execution-item"><b>Кандидати за сделки</b><span class="reason-text">Тук ще се виждат изпълнените, чакащите и блокираните сигнали с конкретна причина.</span></div></div></article></aside></section><section class="daily-lower"><article class="panel"><div class="head"><h3>Market Opportunities</h3><a data-open-view="markets">Всички →</a></div><div class="opportunity-filters" id="opportunityFilters"><button data-market="all" class="active">Всички</button><button data-market="crypto">Крипто</button><button data-market="stocks">Акции</button><button data-market="derivatives">Деривати</button><button data-market="forex">Forex</button></div><div class="scroll"><table><tbody id="axOpportunities"></tbody></table></div></article><article class="panel"><div class="head"><h3>Recent Trades</h3><a data-open-view="trades">Подробно в „Сделки“ →</a></div><div class="scroll"><table><thead><tr><th>Час</th><th>Актив</th><th>Действие</th><th>Стратегия</th><th>P/L €</th></tr></thead><tbody id="trades"></tbody></table></div><div id="axRecentEmpty" class="empty" hidden>Няма нови PAPER сделки. Архивната история е отделена в „Сделки“.</div><span id="axArchiveCount" class="helper-hidden"></span></article><article class="panel" id="newsCard"><div class="head"><h3>News</h3><a id="axAllNews">Всички новини →</a></div><div class="opportunity-filters"><select id="newsFilter"><option value="all">Всички новини</option></select><button id="axNewsEarnings">Отчети</button><button id="axNewsInsider">Insider</button><button id="axNewsCrypto">Крипто</button></div><div id="news" class="news-list"></div></article></section><div class="status-line"><span id="axStatus">PAPER · без реални поръчки</span><span id="return"></span><span id="updated"></span><a id="axOpenConnections">Източници</a></div></main><section id="viewTrades" class="view-panel" hidden><div class="subtitle-row"><div><h2>Сделки</h2><p class="view-caption">История на PAPER изпълненията, стратегия и причини за действията.</p></div><button id="axExportTrades">↓ Експорт CSV</button></div><section class="summary" style="grid-template-columns:repeat(4,1fr)"><div class="metric"><small>Реализиран резултат</small><strong id="axHistoryRealized">—</strong></div><div class="metric"><small>Изпълнения</small><strong id="axHistoryCount">—</strong></div><div class="metric"><small>Печеливши / губещи изходи</small><strong id="axHistoryWinLoss">—</strong></div><div class="metric"><small>Такси за избраните изпълнения</small><strong id="axHistoryFees">—</strong></div></section><section class="trade-workspace"><article class="panel trade-history"><div class="trade-filters"><select id="axHistoryDays"><option value="1">Последни 24 ч.</option><option value="7">7 дни</option><option value="30">30 дни</option><option value="all">Всичко</option></select><select id="axHistoryMarket"><option value="">Всички пазари</option><option value="crypto">Крипто</option><option value="derivatives">Деривати</option><option value="stocks">Акции</option><option value="forex">Forex</option></select><select id="axHistoryStrategy"><option value="">Всички стратегии</option><option value="trend">Тренд</option><option value="vwap">VWAP</option><option value="momentum">Импулс</option><option value="mean_reversion">Връщане към средната</option><option value="breakout">Пробив</option></select><select id="axHistorySide"><option value="">Всички изпълнения</option><option value="SELL">Продажби</option><option value="BUY">Покупки</option></select></div><div class="scroll"><table class="trade-rows"><thead><tr><th>Час</th><th>Актив</th><th>Действие</th><th>Стратегия</th><th>Количество</th><th>Вход</th><th>Изход</th><th>Такса €</th><th>P/L €</th><th>Причина</th></tr></thead><tbody id="axHistoryRows"></tbody></table><div id="axHistoryEmpty" class="empty" hidden>Няма изпълнения за избрания период.</div></div><div class="pagination"><span id="axHistoryPagination"></span><span><button id="axHistoryPrev">‹</button><button id="axHistoryNext">›</button></span></div></article><aside><article class="panel"><div class="head" style="padding:17px"><h3>Подробности за сделката</h3><span class="paper">PAPER</span></div><div id="axTradeDetails" class="details-block">Избери изпълнение от таблицата.</div><div class="detail-actions"><button id="axShowTradeChart" disabled>Виж графиката →</button></div></article></aside></section><details class="notice"><summary>Показатели и крива на PAPER бюджета</summary><article class="panel" id="performanceCard"><div class="head"><h3>Performance</h3><div class="opportunity-filters"><button class="active" data-performance="1d">1D</button><button data-performance="1w">1W</button><button data-performance="1m">1M</button><button data-performance="all">ALL</button></div></div><div class="performance-kpis"><div><small>Total Return</small><strong id="perfReturn" class="green">—</strong></div><div><small>Realized P/L</small><strong id="axRealized">—</strong></div><div><small>Unrealized P/L</small><strong id="axUnrealized">—</strong></div><div><small>Profit Factor</small><strong id="axPerfFactor">—</strong></div></div><div class="performance-extra"><span>Win Rate <b id="perfWin">—</b></span><span>Max Drawdown <b id="axPerfDrawdown">—</b></span></div><div id="v33curve" class="v33-curve"></div><div class="tiny" id="performanceNotice"></div><span class="helper-hidden" id="perfClosed"></span></article><div class="performance-extra"><span>Общо изпълнения: <b id="tradeCount">—</b></span><span>Win rate: <b id="winRate">—</b></span><span>Profit factor: <b id="profitFactor">—</b></span><span>Drawdown: <b id="headerDrawdown">—</b></span></div></details><details class="notice"><summary>Архивна история и запазени позиции</summary><p class="view-caption">Архивните резултати не се включват като нови PAPER сделки. Запазените позиции не са обезпечение за авторежима.</p><div id="axLegacyPositions"></div><table class="trade-rows"><thead><tr><th>Дата</th><th>Актив</th><th>Действие</th><th>Цена</th><th>Архивен P/L</th></tr></thead><tbody id="axLegacyRows"></tbody></table></details></section><section id="viewStrategies" class="view-panel" hidden><h2>Стратегии и обучение</h2><p class="view-caption">Адаптивен избор между проверени правила. Целта за деня не увеличава риска и не отменя проверките.</p><article class="panel prompt-panel"><div class="head"><h3>Контролен прозорец · идеи и стратегии</h3><span class="paper">PAPER изследване</span></div><p class="prompt-help">Опиши правила, постави структурирана стратегия или транскрипция. Всяка идея се показва като точни условия и се тества върху отделени данни.</p><textarea id="axStrategyPrompt" placeholder="Пример: EMA 9 пресича EMA 26 нагоре, RSI между 45 и 70, стоп 1%, цел 2%. Изход при обратно пресичане."></textarea><div class="prompt-actions"><button id="axParseStrategy">Разпознай правилата</button><button id="axTestStrategy">Тествай и сравни</button><button id="axAuditTrades">Анализирай сделките</button><span class="prompt-help">Избран актив: <b id="axStudioAsset">BTCUSDT</b></span></div><div id="axParsedRules" class="rule-preview"><b>Разпознатите условия ще се появят тук</b><p>Вход · изход · стоп · цел · период · източник на идеята</p></div><div id="axPromptHistory" class="prompt-feed">Резултатите ще показват такси, спад, брой сделки и тест извън обучаващите данни.</div></article><article class="panel prompt-panel"><h3>Библиотека от предоставените материали</h3><div id="axReferenceLibrary" class="prompt-help"></div></article><section class="learning-grid"><article class="panel"><small class="muted">Адаптивен избор</small><h3 id="axLearningState">—</h3><p id="axLearningMethod" class="view-caption"></p></article><article class="panel"><small class="muted">Валидирани модели</small><h3 id="axLearningModels">—</h3><p class="view-caption">Обучение, отделен тест и проверка при по-високи разходи.</p></article><article class="panel"><small class="muted">Затворени PAPER резултати</small><h3 id="axLearningOutcomes">—</h3><p class="view-caption">Натрупва се собствена история за оценка на резултатите.</p></article></section><article class="panel" style="padding:17px"><h3>Последни оценки на активите</h3><table class="trade-rows"><thead><tr><th>Пазар</th><th>Актив</th><th>Състояние</th><th>Стратегия</th><th>Данни</th></tr></thead><tbody id="axLearningRows"></tbody></table><div id="axLearningEmpty" class="empty">Оценките се появяват след получаване на завършени свещи.</div></article><article class="panel" style="padding:17px;margin-top:16px"><h3>Отделен бектест</h3><p class="view-caption" id="axResearchAsset"></p><button id="axResearchAction">Тествай стратегиите за избрания актив</button><div id="axResearchResult" class="notice"></div></article></section><section id="viewMarkets" class="view-panel" hidden><h2>Пазари и котировки</h2><p class="view-caption">Всяка цена има източник и възраст. При затворен пазар последната цена не се представя като нова котировка.</p><section class="summary" id="axDataCoverage" style="grid-template-columns:repeat(4,1fr)"></section><div class="trade-filters"><input id="axMarketSearch" placeholder="Търси актив…"><select id="axMarketType"><option value="">Всички пазари</option><option value="crypto">Крипто</option><option value="derivatives">Binance USDT perpetual</option><option value="stocks">Акции и ETF</option><option value="forex">Forex</option></select><span class="muted" id="axMarketCount"></span></div><article class="panel"><div class="scroll" style="max-height:460px"><table class="trade-rows"><thead><tr><th>Актив</th><th>Пазар</th><th>Цена</th><th>Състояние</th><th>Възраст</th><th>Източник</th></tr></thead><tbody id="axMarketRows"></tbody></table></div></article><div class="market-ribbons"><section class="ribbon-grid"><article class="panel"><div class="head"><h3>Forex Market (28 Pairs)</h3><span class="tiny">Majors · Minors · Crosses</span></div><div id="v33forex" class="ribbon"></div></article><article class="panel"><div class="head"><h3>Metals (6)</h3><span class="tiny">Exchange-traded proxies</span></div><div id="v33metals" class="ribbon"></div></article></section></div></section><section id="viewSettings" class="view-panel" hidden><h2 style="margin-bottom:17px">Настройки и връзки</h2><section class="panel settings-drawer" id="settingsDrawer" hidden><div class="head"><h3>Настройки · PAPER · 5.6</h3><button id="axSettingsClose">Затвори</button></div>
++<div class="head"><button id="axArm">Enable PAPER</button><button id="axPause">Пауза</button><button id="axKill">Спирачка</button><button id="axReset">Нулирай спирачката (на пауза)</button><select id="axProfile"><option value="conservative">Conservative</option><option value="balanced">Balanced</option><option value="aggressive">Aggressive</option></select><label>Цел % <input id="axTarget" type="number" min="0" max="100" value="20" style="width:65px"></label><button id="axRunResearch">Тествай стратегията</button></div><label>Крипто сканиране <select id="axCryptoScanMode"><option value="active">Активно — всяка нова свещ</option><option value="standard">Стандартно</option></select></label><div id="axAdvancedRisk"><div class="profiles" id="axProfileButtons"><button data-profile="conservative">Conservative</button><button data-profile="balanced">Balanced</button><button class="active" data-profile="aggressive">Aggressive</button></div><label class="risk-slider"><span>⊙ Max Positions</span><input id="axMaxPositions" type="range" min="1" max="20" value="8"><output id="axMaxPositionsValue">8</output></label><label class="risk-slider"><span>⊙ Risk per Trade</span><input id="axRiskRange" type="range" min="0.1" max="2" step="0.1" value="1"><output id="axRiskValue">1.0%</output></label><label class="risk-slider"><span>⊙ Daily Loss Limit</span><input id="axLossRange" type="range" min="1" max="10" step="0.5" value="5"><output id="axLossValue">5.0%</output></label></div><div id="axMessage"></div><div id="axAcceptance"></div><div id="axKPI"></div>
+ <p id="axDataCollector" class="notice"></p>__SETUP__<button id="axQuitApp">Затвори цялата програма</button>
+ <div class="notice" id="axResearch"></div><div id="v33risk" class="notice"></div><div id="sources" class="notice"></div><details class="notice"><summary>MCP връзки · проверено състояние</summary><div id="axMCPStatus"></div></details><div id="systemError" class="notice"></div><div id="crossSignals" class="notice"></div><div id="freshness" class="notice"></div><span id="v33activity"></span><span id="risk" class="helper-hidden"></span><span id="riskDetail" class="helper-hidden"></span><span id="fxstatus" class="helper-hidden"></span></section></section><div class="helper-hidden"><span id="londonClock"></span><span id="newYorkClock"></span><span id="market"></span><span id="systemCard"></span></div>__BINDING__</body></html>--- a/alpha50x_ui_v55.py
++++ b/alpha50x_ui_v55.py
+@@ -2,7 +2,7 @@
+ from alpha50x_ui_v53 import BINDING as PREVIOUS,SETUP_HTML
+ from alpha50x_chart_ui import CHART,CONTROLS
+ from alpha50x_workspace_ui import EXTRA
+-SETUP_HTML=SETUP_HTML.replace('версия 5.4','версия 5.5.1')
++SETUP_HTML=SETUP_HTML.replace('версия 5.4','версия 5.6')
+ 
+ BINDING=PREVIOUS
+ start=BINDING.index('async function chart(){');end=BINDING.index('function curve(',start)
+--- a/alpha50x_web.py
++++ b/alpha50x_web.py
+@@ -23,7 +23,7 @@
+         source=page.read_text(encoding='utf-8')
+         if not preview:
+             source=re.sub(r'<div class="preview-banner">.*?</div>','',source,count=1)
+-            source=source.replace('PAPER 5.5.1 · чернова','PAPER 5.5.1')
++            source=source.replace('PAPER 5.6 · чернова','PAPER 5.6')
+         return source.replace('__SETUP__',setup).replace('__BINDING__',binding.replace('__TOKEN__',json.dumps(token))).encode('utf-8')
+     source=Path(__file__).with_name('index.html').read_text(encoding='utf-8')
+     source=_REMOTE.sub('',_EVENT.sub('',_SCRIPT.sub('',source)))
+@@ -178,6 +178,10 @@
+                         value=data['target']
+                         if type(value) not in (int,float) or not 0<=value<=100:raise ValueError('Invalid target')
+                         supervisor.config['daily_target_pct']=value;j.set_state('daily_target_pct',value)
++                    elif action=='crypto_activity':
++                        mode=data.get('mode')
++                        if mode not in ('active','standard'):raise ValueError('Невалиден режим за крипто сканиране.')
++                        supervisor.config['crypto_scan_mode']=mode;j.set_state('crypto_scan_mode',mode)
+                     elif action=='connections':
+                         supervisor.engine.pause()
+                         supervisor.credentials.save(data.get('values',{}))
+--- a/alpha50x_workspace_ui.py
++++ b/alpha50x_workspace_ui.py
+@@ -1,5 +1,6 @@
+ """Daily execution visibility, stable comparisons and strategy prompt controls."""
+ EXTRA=r'''
++el('axCryptoScanMode').onchange=()=>control('crypto_activity',{mode:el('axCryptoScanMode').value});
+ let signalFilter='all',opportunityKeys=[],compareSignature='',compareBusy=false,compareLast=0,compareRevision=0,studioBusy=false,libraryRendered=false;
+ let comparePreferences;try{comparePreferences=JSON.parse(localStorage.getItem('alpha50x:compare')||'null')}catch(_){}
+ if(!comparePreferences||!Array.isArray(comparePreferences.assets)||!Array.isArray(comparePreferences.strategies))comparePreferences={mode:'assets',assets:['crypto:BTCUSDT','crypto:ETHUSDT','crypto:SOLUSDT'],strategies:['trend','vwap','momentum']};
+@@ -72,6 +73,8 @@
+  updatePrevious();if(!snapshot)return;const auto=snapshot.auto,requested=auto.enabled&&!auto.user_paused&&!snapshot.kill_switch;
+  text('toggle',requested||snapshot.armed?'Ⅱ Пауза':'Старт PAPER');text('axAgentState',snapshot.kill_switch?'СПРЯН':requested?'АВТОРЕЖИМ':snapshot.armed?'РАБОТИ':'НА ПАУЗА');
+  text('autoInfo',auto.enabled?auto.reason:snapshot.armed?'Учебни сделки при валиден сигнал и одобрение на риска.':'PAPER е на пауза. Данните продължават да се обновяват.');
++ const crypto=snapshot.crypto_activity||{};el('axCryptoScanMode').value=crypto.mode||'active';
++ text('axCryptoScanInfo',crypto.mode==='active'?(crypto.running?'Активно крипто сканиране · '+crypto.evaluated_last_minute+' актива проверени за 60 сек. · '+crypto.history_inflight+' зареждат история.':'Крипто скенерът изчаква данни.'):'Стандартно крипто сканиране.');
+  const all=snapshot.execution?.items||[],counts=snapshot.execution?.counts||{};
+  text('axExecutionSummary',(counts.FILLED||0)+' изпълнени сигнала · '+((counts.BLOCKED||0)+(counts.QUEUED||0))+' изчакващи проверка или отпадане на ограничение');
+  const host=el('axExecutionFeed');host.replaceChildren();for(const item of all.slice(0,8)){const div=document.createElement('div');div.className='execution-item';const name=document.createElement('b'),reason=document.createElement('span');name.textContent=item.symbol+' · '+(item.side==='BUY'?'КУПИ':'ПРОДАЙ')+' · '+executionLabel(item);reason.className='reason-text';reason.textContent=reasonLabel(item.reason);div.append(name,reason);div.onclick=()=>selectAsset(item.market,item.symbol);host.appendChild(div)}
+--- a/test_alpha50x_crypto_activity.py
++++ b/test_alpha50x_crypto_activity.py
+@@ -0,0 +1,217 @@
++"""Synthetic market observations; actual strategies, Guardian and PAPER fills."""
++from concurrent.futures import Future
++from dataclasses import asdict, replace
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++
++from alpha50x_core import Journal
++from alpha50x_crypto_activity import CryptoActivity
++from alpha50x_models import FX
++from alpha50x_runtime import Supervisor, load_config
++from alpha50x_strategies import Signal, Strategy
++from test_alpha50x_unified import NOW, candles, quote, MockReference
++
++
++class HistoryProvider:
++    def __init__(self):
++        self.calls = []
++        self.gate = None
++        self.error = None
++
++    def candles(self, market, symbol):
++        self.calls.append((market, symbol))
++        if self.gate is not None:
++            self.gate.wait(5)
++        if self.error:
++            raise self.error
++        return candles(NOW, market, symbol)
++
++    def status(self):
++        return {}
++
++
++class ActivityTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.j = Journal(Path(self.tmp.name)/'synthetic.sqlite')
++        self.j.deposit_virtual('EUR', 100)
++        self.now = NOW
++        self.provider = HistoryProvider()
++        self.s = Supervisor(self.j, providers=self.provider, clock=lambda: self.now/1000,
++                            acceptance_passed=True, reference=MockReference())
++        self.worker = CryptoActivity(self.s, monotonic=lambda: 0)
++        self.s.crypto_activity = self.worker
++        self.s.config['enabled_markets'] = ['crypto']
++        self.s.engine.arm('ENABLE PAPER')
++
++    def tearDown(self):
++        if self.provider.gate:
++            self.provider.gate.set()
++        self.s.close()
++        self.j.close()
++        self.tmp.cleanup()
++
++    def universe(self, count=1, warm=True):
++        symbols = ['C'+str(i)+'USDT' for i in range(count)]
++        self.s.config['watchlists']['crypto'] = symbols
++        qs = [quote(self.now, 'crypto', symbol, candles()[-1].close) for symbol in symbols]
++        self.s.ingest(qs, {'USDT': FX('USDT', 1, 1, self.now, 'SYNTHETIC')}, now=self.now)
++        if warm:
++            for symbol in symbols:
++                self.s.history_cache[('crypto', symbol)] = candles(NOW, 'crypto', symbol)
++        return symbols
++
++    def fills(self):
++        return self.j.db.execute('SELECT symbol,side FROM ax_fills').fetchall()
++
++    def test_opportunity_outside_legacy_batch_fills_once_with_real_strategy(self):
++        symbols = self.universe(100)
++        limits = asdict(self.s.engine.guardian.limits)
++        original = Strategy.evaluate
++        def evaluate(strategy, bars, **kwargs):
++            if bars[-1].symbol == symbols[-1]:
++                return original(strategy, bars, **kwargs)
++            return Signal('HOLD', 'SYNTHETIC_NO_ENTRY', bars[-1].end_ms, .02, {})
++        with patch.object(Strategy, 'evaluate', evaluate):
++            for _ in range(8):
++                self.worker.pulse()
++            self.assertEqual(self.fills(), [(symbols[-1], 'BUY')])
++            for _ in range(8):
++                self.worker.pulse()
++        self.assertEqual(len(self.fills()), 1)
++        self.assertEqual(self.worker.snapshot()['evaluated_last_minute'], 100)
++        self.assertEqual(self.provider.calls, [])
++        self.assertEqual(asdict(self.s.engine.guardian.limits), limits)
++
++    def test_manual_pause_and_kill_are_respected(self):
++        self.universe()
++        self.s.engine.pause()
++        self.j.set_state('auto_paper_paused', True)
++        self.worker.pulse()
++        self.assertEqual(self.fills(), [])
++        self.assertFalse(self.j.trading_enabled())
++        self.s.engine.pause(kill=True)
++        self.worker.processed.clear()
++        self.worker.pulse()
++        self.assertTrue(self.j.state('kill_switch'))
++        self.assertEqual(self.fills(), [])
++
++    def test_loss_cooldown_still_blocks(self):
++        self.universe()
++        self.j.set_state('last_loss_ms', self.now)
++        self.worker.pulse()
++        self.assertEqual(self.fills(), [])
++        reasons = [r[0] for r in self.j.db.execute('SELECT reason FROM ax_decisions')]
++        self.assertIn('LOSS_COOLDOWN', reasons)
++
++    def test_max_positions_still_caps_more_frequent_entries(self):
++        self.universe(12)
++        self.s.engine.guardian.limits = replace(self.s.engine.guardian.limits, max_positions=1)
++        self.worker.pulse()
++        self.assertEqual(len(self.fills()), 1)
++        self.assertGreater(self.j.balance(), 0)
++
++    def test_only_new_closed_stream_candle_triggers_another_evaluation(self):
++        symbol = self.universe()[0]
++        class Stream:
++            lock = threading.Lock()
++            bars = {}
++            forming = {}
++            def snapshot(self, now):return {}, None
++            def close(self):pass
++        stream = Stream();self.s.stream = stream
++        self.worker.pulse()
++        initial = self.j.db.execute('SELECT count(*) FROM ax_decisions').fetchone()[0]
++        last = candles(NOW, 'crypto', symbol)[-1]
++        stream.forming[symbol] = replace(last, start_ms=NOW)
++        self.worker.pulse()
++        self.assertEqual(self.j.db.execute('SELECT count(*) FROM ax_decisions').fetchone()[0], initial)
++        self.now += 60000
++        self.s.ingest([quote(self.now, 'crypto', symbol, last.close)], {'USDT': FX('USDT', 1, 1, self.now, 'SYNTHETIC')}, now=self.now)
++        stream.bars[symbol] = {NOW: replace(last, start_ms=NOW)}
++        self.worker.pulse()
++        self.assertGreater(self.j.db.execute('SELECT count(*) FROM ax_decisions').fetchone()[0], initial)
++        self.assertEqual(self.worker.processed[symbol], self.now)
++        self.assertEqual(len(self.fills()), 1)
++
++    def test_stale_quotes_fx_and_missing_book_never_become_opportunities(self):
++        symbols = self.universe(3, warm=False)
++        self.s.engine.quotes[('crypto', symbols[0])] = replace(self.s.engine.quotes[('crypto', symbols[0])], timestamp_ms=NOW-6000)
++        self.s.engine.quotes[('crypto', symbols[1])] = replace(self.s.engine.quotes[('crypto', symbols[1])], ask_size=0)
++        self.s.engine.quotes[('crypto', symbols[2])] = replace(self.s.engine.quotes[('crypto', symbols[2])], ask=99)
++        self.worker.pulse()
++        self.assertEqual(self.worker.snapshot()['fresh_quotes'], 0)
++        self.assertEqual(self.provider.calls, [])
++        self.s.engine.fx['USDT'] = FX('USDT', 1, 1, NOW-61000, 'SYNTHETIC')
++        self.worker.pulse()
++        self.assertEqual(self.fills(), [])
++
++    def test_forming_candles_gaps_and_wrong_symbols_cannot_create_signals(self):
++        bars = candles()
++        forming = replace(bars[-1], start_ms=NOW)
++        self.assertEqual(CryptoActivity.valid_history([forming], 'BTCUSDT', NOW), [])
++        self.assertEqual(CryptoActivity.valid_history([*bars[:50], *bars[90:]], 'BTCUSDT', NOW), [])
++        with self.assertRaisesRegex(ValueError, 'WRONG_CRYPTO_HISTORY'):
++            CryptoActivity.valid_history(bars, 'ETHUSDT', NOW)
++        self.assertEqual(CryptoActivity.valid_history(bars, 'BTCUSDT', NOW+120000), [])
++
++    def test_slow_history_is_bounded_and_does_not_block_local_scan(self):
++        symbols = self.universe(10, warm=False)
++        self.provider.gate = threading.Event()
++        for _ in range(10):
++            self.worker.pulse()
++        self.assertEqual(len(self.worker.jobs), 1)
++        for _ in range(12):
++            self.now += 250
++            self.worker.pulse()
++        self.assertEqual(len(self.worker.jobs), 4)
++        self.s.history_cache[('crypto', symbols[-1])] = candles(NOW, 'crypto', symbols[-1])
++        self.worker.pulse()
++        self.assertEqual(self.fills(), [(symbols[-1], 'BUY')])
++        self.assertFalse(self.provider.gate.is_set())
++
++    def test_history_result_is_harvested_and_rate_errors_back_off(self):
++        symbol = self.universe(warm=False)[0]
++        future = Future();future.set_result(candles(NOW, 'crypto', symbol))
++        self.worker.jobs[symbol] = future
++        self.worker.pulse()
++        self.assertEqual(self.fills(), [(symbol, 'BUY')])
++        self.s.history_cache.clear()
++        future = Future();future.set_exception(ValueError('SYNTHETIC_BAD_HISTORY'))
++        self.worker.jobs[symbol] = future
++        self.worker.pulse()
++        self.assertGreater(self.worker.retry_at[symbol], self.now)
++        self.assertEqual(self.provider.calls, [])
++
++    def test_standard_mode_and_shutdown_do_not_arm_or_submit(self):
++        self.universe(warm=False)
++        self.s.config['crypto_scan_mode'] = 'standard'
++        self.s.engine.pause()
++        self.worker.pulse()
++        self.assertFalse(self.worker.snapshot()['running'])
++        self.assertEqual(self.provider.calls, [])
++        self.s.config['crypto_scan_mode'] = 'active'
++        self.s.stop_event.set()
++        self.s.auto.configure(crypto_first=True)
++        self.s.auto.tick(self.now)
++        self.worker.pulse()
++        self.assertFalse(self.j.trading_enabled())
++        self.assertEqual(self.provider.calls, [])
++
++    def test_scan_mode_persists_without_changing_risk_or_manual_intent(self):
++        self.j.set_state('crypto_scan_mode', 'standard')
++        self.j.set_state('auto_paper_paused', True)
++        other = Supervisor(self.j, providers=self.provider, clock=lambda: NOW/1000, reference=MockReference())
++        try:
++            self.assertEqual(other.config['crypto_scan_mode'], 'standard')
++            self.assertTrue(self.j.state('auto_paper_paused'))
++            self.assertEqual(asdict(other.engine.guardian.limits), load_config()['limits'])
++        finally:
++            other.close()
++
++
++if __name__ == '__main__':
++    unittest.main()
