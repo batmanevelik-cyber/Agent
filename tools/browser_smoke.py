@@ -158,7 +158,15 @@ def main():
                 assert 'Цел: 2' in evaluate("document.getElementById('axParsedRules').innerText")
                 (output/'strategies.png').write_bytes(base64.b64decode(call('Page.captureScreenshot',{'format':'png'})['data']))
             evaluate("document.querySelector('[data-view=markets]').click()")
-            assert '12.00 USDT' in evaluate("document.getElementById('axMarketRows').innerText")
+            # The prompt action can still be refreshing the shared snapshot
+            # when navigation completes. Require the actual expected price,
+            # with the same bounded wait used for header/history updates.
+            market_rows=''
+            for _ in range(50):
+                market_rows=evaluate("document.getElementById('axMarketRows').innerText")
+                if '12.00 USDT' in market_rows:break
+                time.sleep(.1)
+            assert '12.00 USDT' in market_rows,market_rows[:700]
             call('Runtime.evaluate',{'expression':"document.querySelector('[data-view=settings]').click()"})
             setup=call('Runtime.evaluate',{'expression':'document.body.innerText','returnByValue':True})['result']['value']
             assert 'Свързване на данни' in setup and 'PAPER_FILLED' in setup,setup[-1800:]
