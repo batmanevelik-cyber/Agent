@@ -1,0 +1,68 @@
+name: Windows PAPER validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - downloads/Alpha50X_Setup_5_4.exe
+      - downloads/Alpha50X_5_4_code_update.py
+      - tools/windows_public_validation.py
+      - tools/browser_smoke.py
+      - .github/workflows/windows-validation.yml
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.14']
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Extract public code with synthetic data
+        shell: pwsh
+        run: python tools/windows_public_validation.py --extract --work "$env:RUNNER_TEMP/source"
+      - name: Install pinned core dependencies
+        shell: pwsh
+        run: python -m pip install -r "$env:RUNNER_TEMP/source/requirements.txt"
+      - name: Native Windows acceptance
+        shell: pwsh
+        run: python tools/windows_public_validation.py --work "$env:RUNNER_TEMP/checks" --report "$env:RUNNER_TEMP/native-report.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-windows-${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/native-report.json
+            ${{ runner.temp }}/checks/*.log
+            ${{ runner.temp }}/checks/browser/*.png
+      - name: Publish synthetic validation summary
+        if: always()
+        shell: pwsh
+        run: |
+          $report = "$env:RUNNER_TEMP/native-report.json"
+          if (!(Test-Path $report)) {
+            @{passed=$false; failure_type='SetupFailed'; tested_commit=$env:GITHUB_SHA; python='${{ matrix.python }}'; input_seed='synthetic only'; financial_connections_tested=$false} | ConvertTo-Json | Set-Content -Encoding utf8 $report
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin alpha50x-validation
+          if ($LASTEXITCODE -eq 0) { git switch -C alpha50x-validation origin/alpha50x-validation } else { git switch -c alpha50x-validation }
+          New-Item -ItemType Directory -Force validation_reports | Out-Null
+          Copy-Item $report "validation_reports/5_4-python${{ matrix.python }}.json"
+          git add validation_reports
+          git commit -m "Record native Windows ${{ matrix.python }} synthetic validation"
+          for ($i=0; $i -lt 3; $i++) {
+            git push origin HEAD:refs/heads/alpha50x-validation
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            git pull --rebase origin alpha50x-validation
+          }
+          exit 1
