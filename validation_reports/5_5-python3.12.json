@@ -1,7 +1,7 @@
 {
   "platform": "Windows",
   "python": "3.12.10",
-  "tested_commit": "b4ea95f0e5a849942fefca4a188f6f75fb613094",
+  "tested_commit": "37884975e83d5fb9c1ad21f6d485941f12256ac6",
   "production_exe_sha256": "c15768261e410539aede8b883b2a13e4bfb59f3c5d9473916871e5ddca55e181",
   "input_seed": "synthetic only",
   "financial_connections_tested": false,
