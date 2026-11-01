@@ -6,7 +6,7 @@
   "manual_pause_and_kill_preserved": true,
   "credential_fixture_preserved": true,
   "published_seed_digest_unchanged": true,
-  "native_windows_validation": "pending publication approval",
+  "native_windows_validation": "Recorded separately; see WINDOWS_VALIDATION_5_6.json",
   "financial_connections_tested": false,
   "production_exe_sha256": "755b818805371f604e72cbd9a14e438b84bc3d660da951c0fc347e13c0ea7686",
   "tested_commit": "5a713983b681fe7d2241b243faf6261f24eb2f75",
@@ -24,5 +24,5 @@
   },
   "native_mcp_offline_protocol": true,
   "code_updater_sha256": "15bbf3d7575e591c735e047a64d14d02e96a6e2fc569e3b2feeaeab9e0f53564",
-  "published": false
+  "published": true
 }

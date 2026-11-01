@@ -31,11 +31,14 @@ the application suite, browser layout and synthetic installation. Read reports
 from the `alpha50x-validation` branch, matching both commit and executable SHA-256.
 Stage reviewed source/build helpers and public downloads explicitly.
 
-Prepared 5.6 activity work uses `tools/repack_crypto_activity_update.py`, based on
+The 5.6 activity release uses `tools/repack_crypto_activity_update.py`, based on
 the verified 5.5.1 updater and an explicit source whitelist. The UI-only scroll
 repacker remains unchanged. `tools/build_windows_setup.py --version 5_6` selects
 the new package; `--version 5_5_1` still selects the previous one. The embedded
 temporary filename is version independent. The native CI helper and workflow now
 target 5.6; read the matching report before claiming Windows validation. The plain
-source diff is `downloads/CRYPTO_ACTIVITY_5_6.patch`. Current local validation is
-recorded separately; no Windows result is implied by cross-compilation.
+source diff is `downloads/CRYPTO_ACTIVITY_5_6.patch`, checked by applying it to the
+verified 5.5.1 source and comparing every application file to the 5.6 payload.
+`downloads/WINDOWS_VALIDATION_5_6.json` records native Windows Python 3.12/3.14
+results for commit 849e357 and the exact executable digest. Local synthetic
+validation is recorded separately; no live financial connections were certified.

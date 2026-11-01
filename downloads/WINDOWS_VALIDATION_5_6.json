@@ -1,0 +1,67 @@
+{
+  "version": "5.6",
+  "passed": true,
+  "tested_commit": "849e35798361a43c5daed425c52a5f6fe8e3283a",
+  "production_exe_sha256": "755b818805371f604e72cbd9a14e438b84bc3d660da951c0fc347e13c0ea7686",
+  "code_updater_sha256": "15bbf3d7575e591c735e047a64d14d02e96a6e2fc569e3b2feeaeab9e0f53564",
+  "workflow_url": "https://github.com/batmanevelik-cyber/Agent/actions/runs/41355604444",
+  "original_seed_sha256_retained": "d41aa1a8f95c886df82964cb3029e959c49c07ef0239057b1517ff7878c7a26e",
+  "public_payload_contains_customer_database": false,
+  "financial_connections_tested": false,
+  "download_verification": {
+    "http": 200,
+    "content_type": "application/octet-stream",
+    "bytes": 3612672,
+    "sha256": "755b818805371f604e72cbd9a14e438b84bc3d660da951c0fc347e13c0ea7686"
+  },
+  "native_windows_reports": [
+    {
+      "platform": "Windows",
+      "python": "3.12.10",
+      "tested_commit": "849e35798361a43c5daed425c52a5f6fe8e3283a",
+      "production_exe_sha256": "755b818805371f604e72cbd9a14e438b84bc3d660da951c0fc347e13c0ea7686",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "native_bootstrap_tests": true,
+      "unittest": {
+        "total": 458,
+        "passed": 458,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_assets": 1860,
+      "bounded_watchlist_scroll_verified": true,
+      "installer_with_synthetic_seed": true
+    },
+    {
+      "platform": "Windows",
+      "python": "3.14.9",
+      "tested_commit": "849e35798361a43c5daed425c52a5f6fe8e3283a",
+      "production_exe_sha256": "755b818805371f604e72cbd9a14e438b84bc3d660da951c0fc347e13c0ea7686",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "native_bootstrap_tests": true,
+      "unittest": {
+        "total": 458,
+        "passed": 458,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_assets": 1860,
+      "bounded_watchlist_scroll_verified": true,
+      "installer_with_synthetic_seed": true
+    }
+  ]
+}
