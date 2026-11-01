@@ -16,7 +16,7 @@ def load(path):
 
 def extract(root,work):
     if work.exists() and any(p.name!='native-windows.log' for p in work.iterdir()):raise RuntimeError('Use an empty isolated CI workspace; existing data is preserved')
-    update=load(root/'downloads/Alpha50X_5_4_code_update.py');files=update.unpack_payload()
+    update=load(root/'downloads/Alpha50X_5_5_code_update.py');files=update.unpack_payload()
     if any(name.endswith(('.sqlite','.db','.env','.bin')) for name in files):raise RuntimeError('Non-code payload')
     work.mkdir(parents=True,exist_ok=True)
     for name,value in files.items():(work/name).write_bytes(value)
@@ -33,13 +33,13 @@ def extract(root,work):
 
 def run(root,work,report_path):
     report={'platform':platform.system(),'python':platform.python_version(),'tested_commit':os.environ.get('GITHUB_SHA'),
-        'production_exe_sha256':hashlib.sha256((root/'downloads/Alpha50X_Setup_5_4.exe').read_bytes()).hexdigest(),
+        'production_exe_sha256':hashlib.sha256((root/'downloads/Alpha50X_Setup_5_5.exe').read_bytes()).hexdigest(),
         'input_seed':'synthetic only','financial_connections_tested':False,'passed':False}
     work.mkdir(parents=True,exist_ok=True);log=(work/'native-windows.log').open('w',encoding='utf-8')
     try:
         update,files=extract(root,work);os.chdir(work)
         report['stage']='production_exe'
-        subprocess.run([str(root/'downloads/Alpha50X_Setup_5_4.exe'),'--verify-only'],stdout=log,stderr=subprocess.STDOUT,timeout=30,check=True)
+        subprocess.run([str(root/'downloads/Alpha50X_Setup_5_5.exe'),'--verify-only'],stdout=log,stderr=subprocess.STDOUT,timeout=30,check=True)
         report['production_exe_runs_on_windows']=True
         report['stage']='unittest'
         with (work/'unittest.log').open('w',encoding='utf-8') as out:

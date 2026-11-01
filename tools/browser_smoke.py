@@ -67,7 +67,7 @@ def main():
                         if 'error' in message:raise RuntimeError(message['error'])
                         return message.get('result',{})
             call('Page.enable');call('Runtime.enable');call('Emulation.setDeviceMetricsOverride',{'width':1536,'height':1024,'deviceScaleFactor':1,'mobile':False})
-            call('Page.navigate',{'url':'http://127.0.0.1:'+str(server.server_port)+'/terminal'})
+            call('Page.navigate',{'url':'http://127.0.0.1:'+str(server.server_port)+('/preview/5.5' if os.environ.get('ALPHA50X_UI_PREVIEW') else '/terminal')})
             for _ in range(50):
                 body=call('Runtime.evaluate',{'expression':'document.body.innerText','returnByValue':True}).get('result',{}).get('value','')
                 if 'АКТУАЛНИ ЦЕНИ' in body:break
@@ -104,6 +104,36 @@ def main():
                     time.sleep(.1)
                 assert '2026-10-20' in evaluate("document.getElementById('axNewsDialog').innerText")
                 evaluate("document.getElementById('axNewsDialog').close()")
+            interactive=evaluate("!!document.getElementById('axChartZoomIn')")
+            if interactive:
+                # Check changes in the rendered viewport, not just button labels.
+                initial=evaluate("Number(document.getElementById('chart').dataset.visibleCount)")
+                evaluate("document.getElementById('axChartZoomIn').click()")
+                zoomed=evaluate("Number(document.getElementById('chart').dataset.visibleCount)")
+                assert 12<=zoomed<initial,(initial,zoomed)
+                evaluate("document.getElementById('axChartZoomOut').click()")
+                assert evaluate("Number(document.getElementById('chart').dataset.visibleCount)")>zoomed
+                evaluate("document.querySelector('#chart svg').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true}))")
+                assert evaluate("document.getElementById('chart').dataset.viewportEnd")!='live'
+                evaluate("document.getElementById('axChartTrend').click()")
+                box=evaluate("(()=>{const r=document.getElementById('chart').getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height}})()")
+                for x,y in ((.25,.4),(.7,.6)):
+                    point={'x':box['x']+box['w']*x,'y':box['y']+box['h']*y}
+                    call('Input.dispatchMouseEvent',{'type':'mousePressed','button':'left','clickCount':1,**point})
+                    call('Input.dispatchMouseEvent',{'type':'mouseReleased','button':'left','clickCount':1,**point})
+                assert evaluate("document.querySelectorAll('#chart [data-annotation=trend]').length")==1
+                evaluate("document.getElementById('axChartZoomIn').click()")
+                assert evaluate("document.querySelectorAll('#chart [data-annotation=trend]').length")==1
+                evaluate("document.getElementById('axChartUndo').click()")
+                assert evaluate("document.querySelectorAll('#chart [data-annotation]').length")==0
+                evaluate("document.getElementById('axChartReset').click()")
+                assert evaluate("document.getElementById('chart').dataset.viewportEnd")=='live'
+                evaluate("document.getElementById('axCompareMode').value='strategies';document.getElementById('axCompareMode').dispatchEvent(new Event('change'))")
+                for _ in range(50):
+                    if 'Сигнал' in evaluate("document.getElementById('axCompareGrid').innerText") or 'Анализ' in evaluate("document.getElementById('axCompareGrid').innerText"):break
+                    time.sleep(.1)
+                assert evaluate("document.querySelectorAll('.compare-card').length")==3
+                assert 'Само сравнение' in evaluate("document.getElementById('axCompareGrid').innerText")
             evaluate("document.querySelector('[data-view=trades]').click()")
             for _ in range(30):
                 if evaluate("document.getElementById('axHistoryRows').children.length"):break
@@ -119,6 +149,14 @@ def main():
             assert evaluate("document.getElementById('axHistoryRows').children.length")==0
             evaluate("document.querySelector('[data-view=strategies]').click()")
             assert 'стратегии' in evaluate("document.getElementById('axLearningMethod').innerText")
+            if interactive:
+                evaluate("document.getElementById('axStrategyPrompt').value='EMA 9 пресича EMA 26 нагоре, RSI между 45 и 70, стоп 1%, цел 2%. Изход при обратно пресичане.';document.getElementById('axParseStrategy').click()")
+                for _ in range(50):
+                    if 'RSI 45' in evaluate("document.getElementById('axParsedRules').innerText"):break
+                    time.sleep(.1)
+                assert 'RSI 45' in evaluate("document.getElementById('axParsedRules').innerText")
+                assert 'Цел: 2' in evaluate("document.getElementById('axParsedRules').innerText")
+                (output/'strategies.png').write_bytes(base64.b64decode(call('Page.captureScreenshot',{'format':'png'})['data']))
             evaluate("document.querySelector('[data-view=markets]').click()")
             assert '12.00 USDT' in evaluate("document.getElementById('axMarketRows').innerText")
             call('Runtime.evaluate',{'expression':"document.querySelector('[data-view=settings]').click()"})
