@@ -1,12 +1,12 @@
 {
   "platform": "Windows",
   "python": "3.12.10",
-  "tested_commit": "8d7a804f98065f863631ecdc2465cfcad2e1a488",
+  "tested_commit": "b4ea95f0e5a849942fefca4a188f6f75fb613094",
   "production_exe_sha256": "c15768261e410539aede8b883b2a13e4bfb59f3c5d9473916871e5ddca55e181",
   "input_seed": "synthetic only",
   "financial_connections_tested": false,
-  "passed": false,
-  "stage": "chromium_705_assets",
+  "passed": true,
+  "stage": "complete",
   "production_exe_runs_on_windows": true,
   "unittest": {
     "total": 447,
@@ -17,5 +17,6 @@
     "synthetic_failure_details": []
   },
   "native_mcp_offline_protocol": true,
-  "failure_type": "CalledProcessError"
+  "native_chromium_705_assets": true,
+  "installer_with_synthetic_seed": true
 }
