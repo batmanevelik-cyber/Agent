@@ -66,6 +66,11 @@ def run(root,work,report_path):
         report['installer_with_synthetic_seed']=installed['installed'];report['passed']=True;report['stage']='complete'
     except Exception as error:
         report['failure_type']=type(error).__name__;traceback.print_exc(file=log)
+        # Logs contain synthetic input only. Preserve the actual failing
+        # browser assertion instead of reporting just CalledProcessError.
+        log.flush()
+        tail=(work/'native-windows.log').read_text(encoding='utf-8',errors='replace').splitlines()[-35:]
+        report['synthetic_stage_failure_tail']=[line[:500] for line in tail]
     finally:
         log.close();report_path.parent.mkdir(parents=True,exist_ok=True);report_path.write_text(json.dumps(report,indent=2),encoding='utf-8')
     return 0 if report['passed'] else 1
