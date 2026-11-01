@@ -1,0 +1,54 @@
+{
+  "version": "5.5",
+  "artifact_commit": "8d7a804f98065f863631ecdc2465cfcad2e1a488",
+  "tested_ci_commit": "37884975e83d5fb9c1ad21f6d485941f12256ac6",
+  "artifact_sha256": "c15768261e410539aede8b883b2a13e4bfb59f3c5d9473916871e5ddca55e181",
+  "public_payload_contains_customer_database": false,
+  "financial_connections_tested": false,
+  "reports": [
+    {
+      "platform": "Windows",
+      "python": "3.12.10",
+      "tested_commit": "37884975e83d5fb9c1ad21f6d485941f12256ac6",
+      "production_exe_sha256": "c15768261e410539aede8b883b2a13e4bfb59f3c5d9473916871e5ddca55e181",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "unittest": {
+        "total": 447,
+        "passed": 447,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_705_assets": true,
+      "installer_with_synthetic_seed": true
+    },
+    {
+      "platform": "Windows",
+      "python": "3.14.10",
+      "tested_commit": "37884975e83d5fb9c1ad21f6d485941f12256ac6",
+      "production_exe_sha256": "c15768261e410539aede8b883b2a13e4bfb59f3c5d9473916871e5ddca55e181",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "unittest": {
+        "total": 447,
+        "passed": 447,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_705_assets": true,
+      "installer_with_synthetic_seed": true
+    }
+  ]
+}
