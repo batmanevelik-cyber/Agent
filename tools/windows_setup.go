@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-//go:embed Alpha50X_5_5_1_code_update.py
+//go:embed alpha50x_public_update.py
 var payload []byte
 var payloadDigest string
 
@@ -102,7 +102,7 @@ func main() {
 	flag.Parse()
 	if !payloadOK(){fmt.Fprintln(os.Stderr,"Embedded updater checksum failed");os.Exit(1)}
 	if *verify{fmt.Println("PASS: embedded code-only updater checksum");return}
-	fmt.Println("Alpha50X 5.5.1 - bounded watchlist scrolling")
+	fmt.Println("Alpha50X - PAPER code update")
 	logdir:=filepath.Join(*target,"data","logs")
 	if err:=os.MkdirAll(logdir,0700);err!=nil{fmt.Fprintln(os.Stderr,"Cannot create local setup log");os.Exit(1)}
 	file,err:=os.OpenFile(filepath.Join(logdir,"setup-"+time.Now().Format("20060102-150405")+".log"),os.O_CREATE|os.O_WRONLY|os.O_EXCL,0600)

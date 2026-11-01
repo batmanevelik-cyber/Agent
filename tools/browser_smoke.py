@@ -84,6 +84,19 @@ def main():
                 result=call('Runtime.evaluate',{'expression':expression,'returnByValue':True,'awaitPromise':True})
                 assert not result.get('exceptionDetails'),result
                 return result['result'].get('value')
+            # Use the actual settings event path. Scanning mode must persist
+            # without arming a paused service or changing its risk limits.
+            risk_before=dict(supervisor.config['limits'])
+            for mode in ('standard','active'):
+                evaluate("(()=>{const e=document.getElementById('axCryptoScanMode');e.value="+json.dumps(mode)+";e.dispatchEvent(new Event('change'));})()")
+                for _ in range(50):
+                    if supervisor.journal.state('crypto_scan_mode')==mode:break
+                    time.sleep(.1)
+                assert supervisor.config['crypto_scan_mode']==mode
+                assert supervisor.journal.state('crypto_scan_mode')==mode
+                assert not supervisor.journal.trading_enabled()
+                assert supervisor.config['limits']==risk_before
+            assert evaluate("document.getElementById('axCryptoScanInfo').innerText.length")>0
             if stress:assert checks['rows']==sum(map(len,lists.values())),checks
             for width in (1855,1536,1280):
                 call('Emulation.setDeviceMetricsOverride',{'width':width,'height':1024,'deviceScaleFactor':1,'mobile':False})

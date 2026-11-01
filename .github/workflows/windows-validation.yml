@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - downloads/Alpha50X_Setup_5_5_1.exe
-      - downloads/Alpha50X_5_5_1_code_update.py
+      - downloads/Alpha50X_Setup_5_6.exe
+      - downloads/Alpha50X_5_6_code_update.py
       - tools/windows_public_validation.py
       - tools/browser_smoke.py
       - tools/windows_setup.go
@@ -64,7 +64,7 @@ jobs:
           git fetch origin alpha50x-validation
           if ($LASTEXITCODE -eq 0) { git switch -C alpha50x-validation origin/alpha50x-validation } else { git switch -c alpha50x-validation }
           New-Item -ItemType Directory -Force validation_reports | Out-Null
-          Copy-Item $report "validation_reports/5_5_1-python${{ matrix.python }}.json"
+          Copy-Item $report "validation_reports/5_6-python${{ matrix.python }}.json"
           git add validation_reports
           git commit -m "Record native Windows ${{ matrix.python }} synthetic validation"
           for ($i=0; $i -lt 3; $i++) {
