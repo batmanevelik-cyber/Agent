@@ -1,0 +1,22 @@
+{
+  "platform": "Windows",
+  "python": "3.14.9",
+  "tested_commit": "d71a5b27e71c45689425e6103e312eaa564b275d",
+  "production_exe_sha256": "632c5054dfc69ef68ac3bfbacfc34c1589fb20e4e50ea22e44e88b9628a2ffb1",
+  "input_seed": "synthetic only",
+  "financial_connections_tested": false,
+  "passed": false,
+  "stage": "unittest",
+  "production_exe_runs_on_windows": true,
+  "unittest": {
+    "total": 416,
+    "passed": 414,
+    "skipped": 0,
+    "failures": [
+      "test_alpha50x_launcher_v4.LauncherTests.test_existing_ledger_accepted_without_mutation",
+      "test_alpha50x_launcher_v4.LauncherTests.test_launcher_invokes_readonly_server"
+    ],
+    "errors": []
+  },
+  "failure_type": "RuntimeError"
+}
