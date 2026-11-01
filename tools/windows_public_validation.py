@@ -45,7 +45,8 @@ def run(root,work,report_path):
         with (work/'unittest.log').open('w',encoding='utf-8') as out:
             result=unittest.TextTestRunner(stream=out,verbosity=2).run(unittest.defaultTestLoader.discover(str(work),'test_*.py'))
         report['unittest']={'total':result.testsRun,'passed':result.testsRun-len(result.errors)-len(result.failures)-len(result.skipped),
-            'skipped':len(result.skipped),'failures':[case.id() for case,_ in result.failures],'errors':[case.id() for case,_ in result.errors]}
+            'skipped':len(result.skipped),'failures':[case.id() for case,_ in result.failures],'errors':[case.id() for case,_ in result.errors],
+            'synthetic_failure_details':[{'case':case.id(),'tail':'\n'.join(line[:350] for line in detail.splitlines()[-8:])} for case,detail in result.failures+result.errors]}
         if not result.wasSuccessful():raise RuntimeError('Native unit tests failed')
         report['stage']='mcp_dependencies_and_protocol'
         sdk=work/'protocol-sdk';subprocess.run([sys.executable,'-m','venv',str(sdk)],check=True,stdout=log,stderr=subprocess.STDOUT,timeout=60)
