@@ -1,0 +1,21 @@
+{
+  "platform": "Windows",
+  "python": "3.12.10",
+  "tested_commit": "e275f2d7fd1b7c2f87efd01ec49d38c2fc1d3479",
+  "production_exe_sha256": "a749b6a89d68d060e4aef65811de1259a9cb107a45c36bfa02e0fd213508689c",
+  "input_seed": "synthetic only",
+  "financial_connections_tested": false,
+  "passed": false,
+  "stage": "chromium_705_assets",
+  "production_exe_runs_on_windows": true,
+  "unittest": {
+    "total": 446,
+    "passed": 446,
+    "skipped": 0,
+    "failures": [],
+    "errors": [],
+    "synthetic_failure_details": []
+  },
+  "native_mcp_offline_protocol": true,
+  "failure_type": "CalledProcessError"
+}
