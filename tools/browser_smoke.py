@@ -28,6 +28,8 @@ def main():
         from test_alpha50x_unified import quote
         from dataclasses import replace
         lists=load_config()['watchlists'];lists['derivatives']=['1000BONKUSDT',*['CONTRACT'+str(i)+'USDT' for i in range(521)]]
+        crypto_count=int(os.environ.get('ALPHA50X_BROWSER_CRYPTO_COUNT',len(lists['crypto'])))
+        lists['crypto'] += ['MOCKCOIN'+str(i)+'USDT' for i in range(max(0,crypto_count-len(lists['crypto'])))]
         supervisor.config['watchlists']=lists;supervisor.config['enabled_markets']=list(lists)
         rates={currency:FX(currency,1,1,NOW,'MOCK STRESS FX') for currency in ('USDT','USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD')}
         quotes=[]
@@ -56,7 +58,7 @@ def main():
         port=active.read_text().splitlines()[0]
         with urlopen('http://127.0.0.1:'+port+'/json/list') as response:targets=json.load(response)
         page=next(t for t in targets if t['type']=='page');sequence=0;errors=[]
-        with connect(page['webSocketDebuggerUrl'],proxy=None,open_timeout=3) as ws:
+        with connect(page['webSocketDebuggerUrl'],proxy=None,open_timeout=3,max_size=8_000_000) as ws:
             def call(method,params=None):
                 nonlocal sequence
                 sequence+=1;ws.send(json.dumps({'id':sequence,'method':method,'params':params or {}}))
@@ -82,11 +84,15 @@ def main():
                 result=call('Runtime.evaluate',{'expression':expression,'returnByValue':True,'awaitPromise':True})
                 assert not result.get('exceptionDetails'),result
                 return result['result'].get('value')
-            if stress:assert checks['rows']==705,checks
+            if stress:assert checks['rows']==sum(map(len,lists.values())),checks
             for width in (1855,1536,1280):
                 call('Emulation.setDeviceMetricsOverride',{'width':width,'height':1024,'deviceScaleFactor':1,'mobile':False})
                 layout=evaluate("(()=>{const w=document.querySelector('.watch-scroll'),c=document.querySelector('#scanner tr td');return {width:w.clientWidth,scroll:w.scrollWidth,font:parseFloat(getComputedStyle(c).fontSize),page:document.documentElement.scrollWidth,screen:document.documentElement.clientWidth}})()")
                 assert layout['scroll']<=layout['width']+1 and layout['font']>=13 and layout['page']<=layout['screen'],layout
+                if os.environ.get('ALPHA50X_BROWSER_SCROLL_CHECK')=='1':
+                    scroll=evaluate("(()=>{const w=document.querySelector('.watch-scroll'),p=w.closest('article'),y=scrollY;w.scrollTop=240;const result={height:w.clientHeight,content:w.scrollHeight,moved:w.scrollTop,pageMoved:scrollY!==y,panelHeight:p.getBoundingClientRect().height,lowerTop:document.querySelector('.daily-lower').getBoundingClientRect().top+scrollY};w.scrollTop=0;return result})()")
+                    assert scroll['height']<=600 and scroll['panelHeight']<900 and scroll['lowerTop']<1800,scroll
+                    assert scroll['content']>scroll['height']*2 and scroll['moved']>0 and not scroll['pageMoved'],scroll
             call('Emulation.setDeviceMetricsOverride',{'width':1855 if stress else 1536,'height':1024,'deviceScaleFactor':1,'mobile':False})
             before=evaluate("({price:document.getElementById('axSelectedPrice').innerText,equity:document.getElementById('equity').innerText,chart:document.getElementById('chart').innerHTML})")
             stream=SpotStream(['BTCUSDT']);stream.connected=True;supervisor.stream=stream
@@ -185,7 +191,7 @@ def main():
             call('Emulation.setDeviceMetricsOverride',{'width':390,'height':844,'deviceScaleFactor':1,'mobile':False})
             dimensions=evaluate('({width:document.documentElement.clientWidth,content:document.documentElement.scrollWidth})')
             assert dimensions['content']<=dimensions['width'],dimensions
-            print('PASS: Chromium dashboard '+('705 actual fixture assets; ' if stress else '')+'readable sidebar at 1280/1536/1855 without horizontal scroll; live price/header; history/filter; navigation; stop; mobile overflow.')
+            print('PASS: Chromium dashboard '+(str(checks['rows'])+' actual fixture assets; ' if stress else '')+'readable sidebar at 1280/1536/1855 without horizontal scroll; bounded vertical scroll when requested; live price/header; history/filter; navigation; stop; mobile overflow.')
     finally:
         if os.name=='nt':subprocess.run(['taskkill','/PID',str(proc.pid),'/T','/F'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         else:

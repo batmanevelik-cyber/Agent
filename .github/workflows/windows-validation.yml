@@ -4,10 +4,13 @@ on:
   push:
     branches: [main]
     paths:
-      - downloads/Alpha50X_Setup_5_5.exe
-      - downloads/Alpha50X_5_5_code_update.py
+      - downloads/Alpha50X_Setup_5_5_1.exe
+      - downloads/Alpha50X_5_5_1_code_update.py
       - tools/windows_public_validation.py
       - tools/browser_smoke.py
+      - tools/windows_setup.go
+      - tools/windows_setup_test.go
+      - tools/build_windows_setup.py
       - .github/workflows/windows-validation.yml
 permissions:
   contents: write
@@ -27,6 +30,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
       - name: Extract public code with synthetic data
         shell: pwsh
         run: python tools/windows_public_validation.py --extract --work "$env:RUNNER_TEMP/source"
@@ -57,7 +64,7 @@ jobs:
           git fetch origin alpha50x-validation
           if ($LASTEXITCODE -eq 0) { git switch -C alpha50x-validation origin/alpha50x-validation } else { git switch -c alpha50x-validation }
           New-Item -ItemType Directory -Force validation_reports | Out-Null
-          Copy-Item $report "validation_reports/5_5-python${{ matrix.python }}.json"
+          Copy-Item $report "validation_reports/5_5_1-python${{ matrix.python }}.json"
           git add validation_reports
           git commit -m "Record native Windows ${{ matrix.python }} synthetic validation"
           for ($i=0; $i -lt 3; $i++) {
