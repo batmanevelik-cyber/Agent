@@ -1,0 +1,50 @@
+{
+  "production_commit": "4b0823e75d7f0f37efeb68053f1cc283bc8f1120",
+  "production_exe_sha256": "f9ed42da4b0223084b303c5a9f57304b7b1fa743b224703250204dea6714d61d",
+  "reports": [
+    {
+      "platform": "Windows",
+      "python": "3.12.10",
+      "tested_commit": "4b0823e75d7f0f37efeb68053f1cc283bc8f1120",
+      "production_exe_sha256": "f9ed42da4b0223084b303c5a9f57304b7b1fa743b224703250204dea6714d61d",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "unittest": {
+        "total": 418,
+        "passed": 418,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_705_assets": true,
+      "installer_with_synthetic_seed": true
+    },
+    {
+      "platform": "Windows",
+      "python": "3.14.9",
+      "tested_commit": "4b0823e75d7f0f37efeb68053f1cc283bc8f1120",
+      "production_exe_sha256": "f9ed42da4b0223084b303c5a9f57304b7b1fa743b224703250204dea6714d61d",
+      "input_seed": "synthetic only",
+      "financial_connections_tested": false,
+      "passed": true,
+      "stage": "complete",
+      "production_exe_runs_on_windows": true,
+      "unittest": {
+        "total": 418,
+        "passed": 418,
+        "skipped": 0,
+        "failures": [],
+        "errors": [],
+        "synthetic_failure_details": []
+      },
+      "native_mcp_offline_protocol": true,
+      "native_chromium_705_assets": true,
+      "installer_with_synthetic_seed": true
+    }
+  ]
+}
